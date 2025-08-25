@@ -28,7 +28,7 @@ static EVP_PKEY* gen_ed25519_keypair(void) {
     if (EVP_PKEY_keygen_init(ctx) <= 0) die("EVP_PKEY_keygen_init");
     if (EVP_PKEY_keygen(ctx, &pkey) <= 0) die("EVP_PKEY_keygen");
     EVP_PKEY_CTX_free(ctx);
-    return pkey; // contains both sk and pk
+    return pkey; 
 }
 
 // Ed25519は秘密鍵から公開鍵を抽出する
