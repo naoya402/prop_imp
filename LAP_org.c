@@ -307,7 +307,7 @@ int main(void) {
 
 
     printf("\n======= データ転送フェーズ =======\n");
-    const char *msg = "hello, anonymous world!";
+    const char *msg = "hello world";
     size_t msg_len = strlen(msg);
     printf("C sending plaintext: %s\n", msg);
 
