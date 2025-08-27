@@ -2,45 +2,92 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <arpa/inet.h>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/err.h>
 
-#define ROUTERS 2 //Rn (1,...,n)
-#define NODES ROUTERS + 2 // Rn (1,...,n), C(R0), S(Rn+1)
-#define SID_LEN     32         // SHA-256
-#define PUB_LEN     32         // X25519 raw public
-#define SEC_LEN     32         // X25519 shared secret (pre-KDF)
-#define KEY_LEN     32         // use 256-bit app key = HKDF-out (ここでは簡略化し直接SECを使用)
-#define IV_LEN      12
-#define TAG_LEN     16
+#define ETH_LEN 14
+#define IP_LEN  20
+#define SID_LEN 32
+#define PUB_LEN 32
+#define SEC_LEN 32
+#define KEY_LEN 32
+#define IV_LEN  12
+#define TAG_LEN 16
+#define MAX_PTXT 1024
+#define MAX_PKT  2048
 #define MAX_STATE   8
-#define MAX_PTXT    128
+
+#define ROUTERS 1
+#define NODES   (ROUTERS+2)
 
 typedef enum { SETUP_REQ = 1, SETUP_RESP = 2, DATA_TRANS = 3 } Status;
-
-// ヘッダ・ペイロード・パケット・ノード
+// ---- 共通ヘッダ ----
+// SID(32) | STATUS(1) | DEST(4)
 typedef struct {
-    unsigned char sid[SID_LEN];
-    unsigned char dest[4];
-    uint8_t status;
-} Header;
+    unsigned char sid[SID_LEN];  // セッションID
+    uint8_t status;              // ステータス (SETUP_REQ, SETUP_RESP, DATA_TRANS)
+    unsigned char dest[4];       // 宛先アドレス
 
+    // SETUP_REQ / SETUP_RESP ヘッダ: πリスト情報
+    uint16_t pi_concat_len;           // π リスト長
+    unsigned char *pi_concat;         // π リストデータ
+    // SETUP_RESP ヘッダ: DST_S 情報
+    uint16_t dsts_len;                // DST_S 長
+    unsigned char *dst_s;             // DST_S データ
+
+} Oheader;
+
+// ---- ペイロード ----
 typedef struct {
-    // 経路設定用: 公開鍵を格納（REQでは k_C、RESPでは k_S）
-    unsigned char peer_pub[PUB_LEN];
+    // ---- SETUP_REQ ----
+    unsigned char peer_pub[PUB_LEN];  // 公開鍵 (k_C または k_S) 
 
-    // データ転送用
-    unsigned char iv[IV_LEN];
-    unsigned char ct[MAX_PTXT];
-    size_t        ct_len;
-    unsigned char tag[TAG_LEN];
+    // ---- DATA_TRANS ----
+    unsigned char iv[IV_LEN];         // GCM-IV
+    size_t ct_len;                    // 暗号文長
+    unsigned char ct[MAX_PTXT];       // 暗号文
+    unsigned char tag[TAG_LEN];       // GCM-タグ
 } Payload;
 
+// ========= L2/L3 (Ether/IPv4) ヘッダ =========
+#define ETH_LEN_MIN 14     // VLAN 無し
 typedef struct {
-    Header  h;
+    unsigned char dst[6];
+    unsigned char src[6];
+    uint16_t ethertype;    // 0x0800 = IPv4
+} __attribute__((packed)) EthHdr;
+
+typedef struct {
+    uint8_t  ver_ihl;      // version(4) | IHL(4)
+    uint8_t  tos;
+    uint16_t total_len;
+    uint16_t id;
+    uint16_t frag_off;
+    uint8_t  ttl;
+    uint8_t  proto;
+    uint16_t hdr_checksum;
+    uint32_t src;
+    uint32_t dst;
+    // options may follow (IHL>5)
+} __attribute__((packed)) IPv4Hdr;
+
+static size_t ipv4_header_len_bytes(const IPv4Hdr *ip) {
+    return 4 * (ip->ver_ihl & 0x0F); // IHL * 4
+}
+
+static size_t l3_overlay_offset(const unsigned char *l2) {
+    const EthHdr *eth = (const EthHdr*)l2;
+    (void)eth; // VLAN 無し前提。VLAN 対応は実運用で追加。
+    const IPv4Hdr *ip = (const IPv4Hdr*)(l2 + ETH_LEN_MIN);
+    return ETH_LEN_MIN + ipv4_header_len_bytes(ip); // 14 + IHL*4
+}
+
+typedef struct {
+    Oheader  h;
     Payload p;
 } Packet;
 
@@ -70,16 +117,21 @@ typedef struct {
     } state[MAX_STATE];
 } Node;
 
+
 static void die(const char *msg) {
-    fprintf(stderr, "[FATAL] %s\n", msg);
+    fprintf(stderr, "FATAL: %s\n", msg);
+    exit(EXIT_FAILURE);
+}
+
+static void die_ossl(const char *msg) {
+    fprintf(stderr, "OpenSSL ERROR: %s\n", msg);
+    ERR_print_errors_fp(stderr);
     exit(EXIT_FAILURE);
 }
 
 static void print_hex(const char *label, const unsigned char *buf, size_t len) {
     printf("%s (%zu bytes): ", label, len);
-    for (size_t i = 0; i < len; i++) {
-        printf("%02x", buf[i]);
-    }
+    for (size_t i = 0; i < len; i++) printf("%02x", buf[i]);
     printf("\n");
 }
 
@@ -97,37 +149,30 @@ static EVP_PKEY* gen_x25519_keypair(void) {
     return p;
 }
 
-static EVP_PKEY* gen_ed25519_keypair(void) {
-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
-    if (!ctx) die("EVP_PKEY_CTX_new_id");
-    EVP_PKEY *pkey = NULL;
-    if (EVP_PKEY_keygen_init(ctx) <= 0) die("EVP_PKEY_keygen_init");
-    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) die("EVP_PKEY_keygen");
-    EVP_PKEY_CTX_free(ctx);
-    return pkey; 
-}
-
-
 static EVP_PKEY* import_x25519_pub(const unsigned char *pub) {
     EVP_PKEY *p = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, pub, PUB_LEN);
     if (!p) die("new_raw_public_key");
     return p;
 }
 
-static void get_raw_pub(const EVP_PKEY *pkey, unsigned char pub[PUB_LEN]) {
-    size_t len = PUB_LEN;
-    if (EVP_PKEY_get_raw_public_key(pkey, pub, &len) <= 0 || len != PUB_LEN) die("get_raw_public_key");
+static EVP_PKEY* gen_ed25519_keypair(void) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+    if (!ctx) die_ossl("EVP_PKEY_CTX_new_id");
+    EVP_PKEY *pkey = NULL;
+    if (EVP_PKEY_keygen_init(ctx) <= 0) die_ossl("EVP_PKEY_keygen_init");
+    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) die_ossl("EVP_PKEY_keygen");
+    EVP_PKEY_CTX_free(ctx);
+    return pkey;
 }
 
-// X25519 共有秘密の導出
-static void derive_shared(const EVP_PKEY *my_sk, const EVP_PKEY *peer_pub, unsigned char sec[SEC_LEN]) {
-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new((EVP_PKEY*)my_sk, NULL);
-    if (!ctx) die("derive ctx");
-    if (EVP_PKEY_derive_init(ctx) <= 0) die("derive_init");
-    if (EVP_PKEY_derive_set_peer(ctx, (EVP_PKEY*)peer_pub) <= 0) die("set_peer");
-    size_t outlen = SEC_LEN;
-    if (EVP_PKEY_derive(ctx, sec, &outlen) <= 0 || outlen != SEC_LEN) die("derive");
-    EVP_PKEY_CTX_free(ctx);
+static EVP_PKEY* extract_public_only(const EVP_PKEY *priv) {
+    unsigned char pub[PUB_LEN];
+    size_t publen = sizeof(pub);
+    if (EVP_PKEY_get_raw_public_key(priv, pub, &publen) <= 0)
+        die_ossl("EVP_PKEY_get_raw_public_key");
+    EVP_PKEY *pubkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pub, publen);
+    if (!pubkey) die_ossl("EVP_PKEY_new_raw_public_key");
+    return pubkey;
 }
 
 // AES-GCM暗号化
@@ -164,6 +209,57 @@ static int aead_decrypt(const unsigned char key[KEY_LEN], const unsigned char *c
     return ok == 1; // 1=auth OK
 }
 
+static void sign_data(EVP_PKEY *sk, const unsigned char *data, size_t datalen,
+                      unsigned char **sig, size_t *siglen) {
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) die_ossl("EVP_MD_CTX_new");
+    if (EVP_DigestSignInit(mdctx, NULL, NULL, NULL, sk) <= 0)
+        die_ossl("EVP_DigestSignInit");
+    if (EVP_DigestSign(mdctx, NULL, siglen, data, datalen) <= 0)
+        die_ossl("EVP_DigestSign (len)");
+    *sig = (unsigned char*)OPENSSL_malloc(*siglen);
+    if (!*sig) die_ossl("malloc");
+    if (EVP_DigestSign(mdctx, *sig, siglen, data, datalen) <= 0)
+        die_ossl("EVP_DigestSign");
+    EVP_MD_CTX_free(mdctx);
+}
+
+static int verify_sig(EVP_PKEY *pk, const unsigned char *data, size_t datalen,
+                      const unsigned char *sig, size_t siglen) {
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) die_ossl("EVP_MD_CTX_new");
+    if (EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, pk) <= 0)
+        die_ossl("EVP_DigestVerifyInit");
+    int ok = EVP_DigestVerify(mdctx, sig, siglen, data, datalen);
+    EVP_MD_CTX_free(mdctx);
+    return ok == 1;
+}
+
+static unsigned char* concat2(const unsigned char *a, size_t alen, const unsigned char *b, size_t blen, size_t *outlen) {
+    *outlen = alen + blen;
+    unsigned char *buf = malloc(*outlen);
+    if (!buf) die("malloc failed");
+    memcpy(buf, a, alen);
+    memcpy(buf + alen, b, blen);
+    return buf;
+}
+
+static void node_init(Node *node, int id, const char *name) {
+    memset(node, 0, sizeof(Node));
+    snprintf(node->name, sizeof(node->name), "%s", name);
+    node->id = id;
+    node->sk = gen_ed25519_keypair();
+    node->pk = extract_public_only(node->sk);
+    RAND_bytes(node->addr, sizeof(node->addr));
+    RAND_bytes(node->rand_val, sizeof(node->rand_val));
+}
+
+static void node_free(Node *n) {
+    if (n->dh_sk) EVP_PKEY_free(n->dh_sk);
+    if (n->sk) EVP_PKEY_free(n->sk);
+    if (n->pk) EVP_PKEY_free(n->pk);
+}
+
 // ---- ステート操作 ----
 static void state_set(Node *n, const unsigned char sid[SID_LEN], char prev_addr, int next_addr) {
     for (int i=0;i<MAX_STATE;i++) {
@@ -194,80 +290,127 @@ static int state_get_prev(const Node *n, const unsigned char sid[SID_LEN]) {
     return -1;
 }
 
-
-// Ed25519は秘密鍵から公開鍵を抽出する
-static EVP_PKEY* extract_public_only(const EVP_PKEY *priv) {
-    // For Ed25519, public key can be exported and re-imported as pub-only
-    unsigned char pub[32];
-    size_t publen = sizeof(pub);
-    if (EVP_PKEY_get_raw_public_key(priv, pub, &publen) <= 0) die("EVP_PKEY_get_raw_public_key");
-    EVP_PKEY *pubkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pub, publen);
-    if (!pubkey) die("EVP_PKEY_new_raw_public_key");
-    return pubkey;
+static void get_raw_pub(const EVP_PKEY *pkey, unsigned char pub[PUB_LEN]) {
+    size_t len = PUB_LEN;
+    if (EVP_PKEY_get_raw_public_key(pkey, pub, &len) <= 0 || len != PUB_LEN) die("get_raw_public_key");
 }
 
-// 署名と検証のための関数
-static void sign_data(EVP_PKEY *sk, const unsigned char *data, size_t datalen, unsigned char **sig, size_t *siglen) {
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!mdctx) die("EVP_MD_CTX_new");
-    if (EVP_DigestSignInit(mdctx, NULL, NULL, NULL, sk) <= 0) die("EVP_DigestSignInit");
-    // Ed25519 はハッシュ関数を使用しないので、NULLを指定
-    if (EVP_DigestSign(mdctx, NULL, siglen, data, datalen) <= 0) die("EVP_DigestSign(size)");
-    *sig = (unsigned char*)OPENSSL_malloc(*siglen);
-    if (!*sig) die("OPENSSL_malloc");
-    if (EVP_DigestSign(mdctx, *sig, siglen, data, datalen) <= 0) die("EVP_DigestSign");
-    EVP_MD_CTX_free(mdctx);
+// X25519 共有秘密の導出
+static void derive_shared(const EVP_PKEY *my_sk, const EVP_PKEY *peer_pub, unsigned char sec[SEC_LEN]) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new((EVP_PKEY*)my_sk, NULL);
+    if (!ctx) die("derive ctx");
+    if (EVP_PKEY_derive_init(ctx) <= 0) die("derive_init");
+    if (EVP_PKEY_derive_set_peer(ctx, (EVP_PKEY*)peer_pub) <= 0) die("set_peer");
+    size_t outlen = SEC_LEN;
+    if (EVP_PKEY_derive(ctx, sec, &outlen) <= 0 || outlen != SEC_LEN) die("derive");
+    EVP_PKEY_CTX_free(ctx);
 }
 
-static int verify_sig(EVP_PKEY *pk, const unsigned char *data, size_t datalen, const unsigned char *sig, size_t siglen) {
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!mdctx) die("EVP_MD_CTX_new");
-    if (EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, pk) <= 0) die("EVP_DigestVerifyInit");
-    int ok = EVP_DigestVerify(mdctx, sig, siglen, data, datalen);
-    EVP_MD_CTX_free(mdctx);
-    return ok == 1; // 1 = success, 0 = bad sig, <0 error
+//========= オーバーレイ領域レイアウト =========
+// 共通: SID(32) | STATUS(1) | DEST(4)
+static size_t overlay_header_footprint(void) { return SID_LEN + 1 + 4; }
+
+// SETUP_REQ : + PEER_PUB(32) | u16 pi_concat_len | pi_concat | u16 dsts_len 
+// SETUP_RESP: + PEER_PUB(32) | u16 pi_concat_len | pi_concat | u16 dsts_len | dst_s
+// DATA_TRANS: + IV(12) | u16 ct_len | CT | TAG(16)
+
+// L2/L3 ダミーを埋めて最小 IPv4 ヘッダ (IHL=5) を作る
+static size_t write_l2l3_min(unsigned char *buf, size_t buf_cap) {
+    if (buf_cap < ETH_LEN_MIN + sizeof(IPv4Hdr)) die("buf too small for L2/L3");
+    EthHdr *eth = (EthHdr*)buf;
+    memset(eth->dst, 0xff, 6); // broadcast
+    memset(eth->src, 0x11, 6);
+    eth->ethertype = htons(0x0800);
+    IPv4Hdr *ip = (IPv4Hdr*)(buf + ETH_LEN_MIN);
+    memset(ip, 0, sizeof(*ip));
+    ip->ver_ihl = (4<<4) | 5; // ver=4, IHL=5 => 20B
+    ip->ttl = 64;
+    ip->proto = 0xFD; // experimental
+    return ETH_LEN_MIN + sizeof(IPv4Hdr);
 }
 
-// メモリ確保のためのヘルパー関数
-static void *xmalloc(size_t n) {
-    void *p = malloc(n);
-    if (!p) { perror("malloc"); exit(EXIT_FAILURE); }
-    return p;
+// ======== オーバーレイのビルド/パース ========
+// SETUP_REQ を 34B(=L3末) から書く
+static size_t build_overlay_setup_req(unsigned char *l2, size_t cap, const Packet *pkt) {
+    size_t off = l3_overlay_offset(l2);
+    size_t need = off + overlay_header_footprint() + PUB_LEN;
+    if (cap < need) die("cap too small (setup req)");
+    unsigned char *p = l2 + off;
+    memcpy(p, pkt->h.sid, SID_LEN); p += SID_LEN;
+    *p++ = pkt->h.status;
+    memcpy(p, pkt->h.dest, 4); p += 4;
+    memcpy(p, pkt->p.peer_pub, PUB_LEN); p += PUB_LEN;
+    return (size_t)(p - l2); // 書き終わったバイト位置
 }
 
-// 連結バイト列 a||b を作成
-static unsigned char* concat2(const unsigned char *a, size_t alen, const unsigned char *b, size_t blen, size_t *outlen) {
-    *outlen = alen + blen;
-    unsigned char *buf = (unsigned char*)xmalloc(*outlen);
-    memcpy(buf, a, alen);
-    memcpy(buf + alen, b, blen);
-    return buf;
+// SETUP_RESP を書く（DST_S/πリスト付き）
+static size_t build_overlay_setup_resp(unsigned char *l2, size_t cap, const Packet *pkt,
+                                       const unsigned char *pi_concat, uint16_t pi_concat_len,
+                                       const unsigned char *dst_s, uint16_t dst_s_len) {
+    size_t off = l3_overlay_offset(l2);
+    size_t need = off + overlay_header_footprint() + PUB_LEN + 2 + pi_concat_len + 2 + dst_s_len;
+    if (cap < need) die("cap too small (setup resp)");
+    unsigned char *p = l2 + off;
+    memcpy(p, pkt->h.sid, SID_LEN); p += SID_LEN;
+    *p++ = pkt->h.status;
+    memcpy(p, pkt->h.dest, 4); p += 4;
+    memcpy(p, pkt->p.peer_pub, PUB_LEN); p += PUB_LEN;
+    uint16_t n = htons(pi_concat_len); memcpy(p, &n, 2); p += 2;
+    memcpy(p, pi_concat, pi_concat_len); p += pi_concat_len;
+    n = htons(dst_s_len); memcpy(p, &n, 2); p += 2;
+    memcpy(p, dst_s, dst_s_len); p += dst_s_len;
+    return (size_t)(p - l2);
 }
 
-
-// ---- ノード初期化 ----
-static void node_init(Node *n, int id, const char *name) {
-    memset(n, 0, sizeof(*n));
-    n->id = id;
-    snprintf(n->name, sizeof(n->name), "%s", name);
-    RAND_bytes(n->addr, sizeof(n->addr));
-    RAND_bytes(n->rand_val, sizeof(n->rand_val));
-    n->sk = gen_ed25519_keypair();
-    n->pk = extract_public_only(n->sk);
-    // n->dh_sk = NULL;//gen_x25519_keypair();
-    n->has_sess = 0;
+// DATA_TRANS を書く
+static size_t build_overlay_data_trans(unsigned char *l2, size_t cap, const Packet *pkt) {
+    size_t off = l3_overlay_offset(l2);
+    uint16_t ctlen = (uint16_t)pkt->p.ct_len;
+    size_t need = off + overlay_header_footprint() + IV_LEN + 2 + ctlen + TAG_LEN;
+    if (cap < need) die("cap too small (data trans)");
+    unsigned char *p = l2 + off;
+    memcpy(p, pkt->h.sid, SID_LEN); p += SID_LEN;
+    *p++ = pkt->h.status;
+    memcpy(p, pkt->h.dest, 4); p += 4;
+    memcpy(p, pkt->p.iv, IV_LEN); p += IV_LEN;
+    uint16_t n = htons(ctlen); memcpy(p, &n, 2); p += 2;
+    memcpy(p, pkt->p.ct, ctlen); p += ctlen;
+    memcpy(p, pkt->p.tag, TAG_LEN); p += TAG_LEN;
+    return (size_t)(p - l2);
 }
 
-static void node_free(Node *n) {
-    if (n->dh_sk) EVP_PKEY_free(n->dh_sk);
-    if (n->sk) EVP_PKEY_free(n->sk);
-    if (n->pk) EVP_PKEY_free(n->pk);
-}
+// // オーバーレイ共通ヘッダのパース
+// static int parse_overlay_common(const unsigned char *l2, size_t len, Oheader *out) {
+//     size_t off = l3_overlay_offset(l2);
+//     if (len < off + overlay_header_footprint()) return -1;
+//     const unsigned char *p = l2 + off;
+//     memcpy(out->sid, p, SID_LEN); p += SID_LEN;
+//     out->status = *p++;
+//     memcpy(out->dest, p, 4); p += 4;
+//     (void)p;
+//     return 0;
+// }
+
+// // ルータ処理（先頭ポインタを与える）
+// static int router_process_packet(unsigned char *l2, size_t len, Node *me, int *out_next_id) {
+//     Oheader h;
+//     if (parse_overlay_common(l2, len, &h) != 0) return -1;
+//     int next = state_get_next(me, h.sid);
+//     if (next >= 0) { *out_next_id = next; return 0; }
+//     // 簡易ポリシー（S 以外は+1）
+//     int computed_next = (me->id < (NODES-1)) ? me->id + 1 : me->id;
+//     state_set(me, h.sid, -1, computed_next);
+//     *out_next_id = computed_next;
+//     return 0;
+// }
 
 int main(void) {
     ERR_load_crypto_strings();
     OpenSSL_add_all_algorithms();
     RAND_load_file("/dev/urandom", 32);
+    printf("=== Packet initialized ===\n");
+    printf("Ethernet: %d bytes, IP: %d bytes, Overlay SID field: %d bytes\n",
+           ETH_LEN, IP_LEN, SID_LEN);
 
     // ノードの初期化
     Node nodes[NODES];
@@ -332,6 +475,12 @@ int main(void) {
 
     // 状態保存（prev=0, next=1 or self）
     state_set(&nodes[0], pkt.h.sid, -1, nodes[1].id);
+
+    // ==== メモリ上に L2/L3 + overlay(SETUP_REQ) を構築（送信用）====
+    unsigned char frame[2048]; memset(frame, 0, sizeof(frame));
+    size_t l3end = write_l2l3_min(frame, sizeof(frame));
+    (void)l3end;
+    size_t wire_len = build_overlay_setup_req(frame, sizeof(frame), &pkt);
 
     // 各ノードの処理
     for (int i = 1; i < NODES; i++) {
@@ -424,6 +573,13 @@ int main(void) {
     pkt.h.status = SETUP_RESP;
     memcpy(pkt.p.peer_pub, kS_pub, PUB_LEN);
 
+    // ==== SETUP_RESP をパケットに積む（DST_S と pi_concat を格納）====
+    memset(frame, 0, sizeof(frame));
+    (void)write_l2l3_min(frame, sizeof(frame));
+    wire_len = build_overlay_setup_resp(frame, sizeof(frame), &pkt,
+                                        /*pi_concat*/pi_concat, (uint16_t)total_len,
+                                        /*dst_s*/SigS, (uint16_t)SigS_len);
+
     // 復路は逆順に転送
     int cur = nodes[ROUTERS].id;
     while (cur != -1) {
@@ -482,6 +638,11 @@ int main(void) {
     aead_encrypt(nodes[0].sess_key, (const unsigned char*)msg, msg_len, pkt.h.sid, pkt.p.iv, pkt.p.ct, pkt.p.tag);
     pkt.p.ct_len = msg_len;
 
+    // ==== DATA_TRANS をパケットに積む ====
+    memset(frame, 0, sizeof(frame));
+    (void)write_l2l3_min(frame, sizeof(frame));
+    wire_len = build_overlay_data_trans(frame, sizeof(frame), &pkt);
+
     // 各ノードの処理: state.next で転送
     cur = nodes[0].id;
     while (cur != NODES-1) {
@@ -512,4 +673,3 @@ int main(void) {
     ERR_free_strings();
     return 0;
 }
-
