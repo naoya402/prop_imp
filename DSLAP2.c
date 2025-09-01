@@ -9,7 +9,7 @@
 #include <openssl/sha.h>
 #include <openssl/err.h>
 
-#define ROUTERS 1
+#define ROUTERS 4
 #define NODES   (ROUTERS+2)
 
 #define ETH_LEN 14     // VLAN 無し
@@ -413,15 +413,22 @@ static size_t build_overlay_data_trans(unsigned char *l2, size_t cap, const Pack
     return (size_t)(p - l2 - off);
 }
 
-static int parse_overlay(const unsigned char *buf, size_t len, Packet *pkt) {
+// フレームからパケットをパース
+static int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt) {
+    // L2/L3を読み飛ばす
+    size_t l3end = 34;//read_l2l3_min(frame, frame_len);
+    if (l3end == 0) return -1;
+    // if (parse_overlay(frame + l3end, frame_len - l3end, pkt) < 0) return -1;
+    const unsigned char *buf = frame + l3end;
     const unsigned char *p = buf;
+    size_t len = frame_len - l3end;
     if (len < SID_LEN + 1 + 4) return -1; // sid + status + dest
     
+    //固定ヘッダ
     memcpy(pkt->h.sid, p, SID_LEN); p += SID_LEN;
     pkt->h.status = *p++;
     memcpy(pkt->h.dest, p, 4); p += 4;
     
-
     if (pkt->h.status == SETUP_REQ) {
         // π_LEN
         if (p + 2 > buf + len) return -1;
@@ -440,14 +447,9 @@ static int parse_overlay(const unsigned char *buf, size_t len, Packet *pkt) {
         memcpy(pkt->p.tau, p, pkt->p.tau_len); p += pkt->p.tau_len;
 
     } else if (pkt->h.status == SETUP_RESP) {
-        // π_LEN
+        // π_list_LEN + π_list
         if (p + 2 > buf + len) return -1;
-        // uint16_t pi_len = ntohs(*(uint16_t*)p); p += 2;
         pkt->h.pi_concat_len = ntohs(*(uint16_t*)p); p += 2;
-        // uint16_t pi_len;
-        // memcpy(&pi_len, p, sizeof(uint16_t));
-        // pi_len = ntohs(pi_len);
-        // p += 2;
         if (p + pkt->h.pi_concat_len > buf + len) return -1;
         memcpy(pkt->h.pi_concat, p, pkt->h.pi_concat_len);
         p += pkt->h.pi_concat_len;
@@ -463,7 +465,6 @@ static int parse_overlay(const unsigned char *buf, size_t len, Packet *pkt) {
         memcpy(pkt->p.peer_pub, p, PUB_LEN); p += PUB_LEN;
         if (p + 4 > buf + len) return -1;
         memcpy(pkt->p.rand_val, p, 4); p += 4;
-        // print_hex("RAND_VAL", pkt->p.rand_val, 4);
     } else if (pkt->h.status == DATA_TRANS) {
         // payload: IV + CT_LEN + CT + TAG
         if (p + 12 > buf + len) return -1;
@@ -476,27 +477,15 @@ static int parse_overlay(const unsigned char *buf, size_t len, Packet *pkt) {
     } else {
         return -1; // 未知のステータス
     }
-
-    return 0;
-}
-
-static int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt) {
-    memset(pkt, 0, sizeof(*pkt));
-    // L2/L3を読み飛ばす
-    size_t l3end = 34;//read_l2l3_min(frame, frame_len);
-    if (l3end == 0) return -1;
-    // overlay部分をdecode
-    if (parse_overlay(frame + l3end, frame_len - l3end, pkt) < 0) return -1;
     return 0;
 }
 
 // ルータ処理（SETUP_REQの中継）
 static int router_handle_forward(unsigned char *frame, size_t frame_cap, Node *nodes, int idx) {
     printf("\n=== Node R%d ===\n", idx);
-    Packet *pkt = malloc(sizeof(Packet));
-    if (parse_frame_to_pkt(frame, frame_cap, pkt) != 0) {
+    Packet pkt;
+    if (parse_frame_to_pkt(frame, frame_cap, &pkt) != 0) {
         fprintf(stderr, "R%d: parse failed\n", idx);
-        free(pkt);  
         return -1;
     }
     Node *me = &nodes[idx];
@@ -505,11 +494,11 @@ static int router_handle_forward(unsigned char *frame, size_t frame_cap, Node *n
     unsigned char *pi = NULL, *tau = NULL;
     size_t pi_len = 0, tau_len = 0;
 
-    if (pkt->h.status != SETUP_REQ) { fprintf(stderr,"unexpected status\n"); return -1; }
+    if (pkt.h.status != SETUP_REQ) { fprintf(stderr,"unexpected status\n"); return -1; }
 
     unsigned char sid_chk[SID_LEN];
-    hash_sid_from_pub(pkt->p.peer_pub, sid_chk);
-    if (memcmp(sid_chk, pkt->h.sid, SID_LEN) != 0) {
+    hash_sid_from_pub(pkt.p.peer_pub, sid_chk);
+    if (memcmp(sid_chk, pkt.h.sid, SID_LEN) != 0) {
         fprintf(stderr,"SID verify failed at R%d\n", idx);
         return -1;
     }
@@ -521,8 +510,8 @@ static int router_handle_forward(unsigned char *frame, size_t frame_cap, Node *n
     int prev_addr = me->id - 1;
 
     // 前ノードの τ_{i-1} を検証
-    m = concat2(pkt->h.sid, SID_LEN, nodes[prev_addr].addr, sizeof(nodes[prev_addr].addr), &m_len);
-    if (!verify_sig(nodes[prev_addr].pk, m, m_len, pkt->p.tau, pkt->p.tau_len)) {
+    m = concat2(pkt.h.sid, SID_LEN, nodes[prev_addr].addr, sizeof(nodes[prev_addr].addr), &m_len);
+    if (!verify_sig(nodes[prev_addr].pk, m, m_len, pkt.p.tau, pkt.p.tau_len)) {
         fprintf(stderr, "Verify τ%d failed\n", prev_addr);
         free(m);
         return -1;
@@ -531,57 +520,53 @@ static int router_handle_forward(unsigned char *frame, size_t frame_cap, Node *n
     free(m);
 
     // π_i = Sign(sk_i, τ_{i-1} || r_i)
-    n = concat2(pkt->p.tau, pkt->p.tau_len, me->rand_val, sizeof(me->rand_val), &n_len);
+    n = concat2(pkt.p.tau, pkt.p.tau_len, me->rand_val, sizeof(me->rand_val), &n_len);
     sign_data(me->sk, n, n_len, &pi, &pi_len);
     free(n);
-    if (pkt->h.pi_concat_len + pi_len > sizeof(pkt->h.pi_concat)) {
+    if (pkt.h.pi_concat_len + pi_len > sizeof(pkt.h.pi_concat)) {
         fprintf(stderr,"pi_concat overflow at R%d\n", idx);
         OPENSSL_free(pi);
         return -1;
     }
-    memcpy(pkt->h.pi_concat + pkt->h.pi_concat_len, pi, pi_len);
-    pkt->h.pi_concat_len += pi_len;
+    memcpy(pkt.h.pi_concat + pkt.h.pi_concat_len, pi, pi_len);
+    pkt.h.pi_concat_len += pi_len;
     printf("π%d", idx);
     print_hex(" ", pi, pi_len);
     OPENSSL_free(pi);
 
     // τ_i = Sign(sk_i, sid||addr) (サーバは除く)
     if (me->id != NODES-1) {
-        m2 = concat2(pkt->h.sid, SID_LEN, me->addr, sizeof(me->addr), &m2_len);
+        m2 = concat2(pkt.h.sid, SID_LEN, me->addr, sizeof(me->addr), &m2_len);
         sign_data(me->sk, m2, m2_len, &tau, &tau_len);
         free(m2);
         if (tau_len > SIG_LEN) { OPENSSL_free(tau); fprintf(stderr,"tau_len too big\n"); return -1; }
-        memcpy(pkt->p.tau, tau, tau_len);
-        pkt->p.tau_len = (uint16_t)tau_len;
+        memcpy(pkt.p.tau, tau, tau_len);
+        pkt.p.tau_len = (uint16_t)tau_len;
         // printf("τ%d", idx);
         // print_hex(" ", pkt->p.tau, pkt->p.tau_len);
         OPENSSL_free(tau);
     }
 
     // ステート保存（prev=前ホップアドレス, next=次ホップアドレス or 自身）
-    state_set(me, pkt->h.sid, prev_addr, next_addr, pkt->p.tau, pkt->p.tau_len);
+    state_set(me, pkt.h.sid, prev_addr, next_addr, pkt.p.tau, pkt.p.tau_len);
 
     // フレーム再構築
-    memset(frame, 0, frame_cap);
-    write_l2l3_min(frame, frame_cap);
-    size_t wire_len = build_overlay_setup_req(frame, frame_cap, pkt);
-    printf("Forward frame wire_len=%zu pi_len=%u\n", wire_len, pkt->h.pi_concat_len);
-    free(pkt);
+    size_t wire_len = build_overlay_setup_req(frame, frame_cap, &pkt);
+    printf("Forward frame wire_len=%zu pi_len=%u\n", wire_len, pkt.h.pi_concat_len);
     return 0;
 }
 
 // ルータ処理（SETUP_RESPの中継）
 static int router_handle_reverse(unsigned char *frame, size_t frame_cap, Node *nodes, int idx) {
     printf("\n=== Node R%d ===\n", idx);
-    Packet *pkt = malloc(sizeof(Packet));
-    if (parse_frame_to_pkt(frame, frame_cap, pkt) != 0) {
+    Packet pkt;
+    if (parse_frame_to_pkt(frame, frame_cap, &pkt) != 0) {
         fprintf(stderr, "R%d: parse failed\n", idx);
-        free(pkt);  
         return -1;
     }
     Node *me = &nodes[idx];
     // DST_Sを検証
-    if (!verify_sig(nodes[NODES-1].pk, pkt->h.pi_concat, pkt->h.pi_concat_len, pkt->h.dst_s, pkt->h.dst_s_len)) {
+    if (!verify_sig(nodes[NODES-1].pk, pkt.h.pi_concat, pkt.h.pi_concat_len, pkt.h.dst_s, pkt.h.dst_s_len)) {
         fprintf(stderr,"Verify DST_S failed at R%d\n", idx);
         return -1;
     }
@@ -591,16 +576,16 @@ static int router_handle_reverse(unsigned char *frame, size_t frame_cap, Node *n
     size_t nidx = idx + 1;
     if (nidx == 0) { fprintf(stderr,"invalid nidx\n"); return -1; }
     size_t offset = (nidx - 1) * SIG_LEN;
-    if (offset + SIG_LEN > pkt->h.pi_concat_len) { fprintf(stderr,"pi_concat out of range\n"); return -1; }
-    unsigned char *pi_next = pkt->h.pi_concat + offset;
+    if (offset + SIG_LEN > pkt.h.pi_concat_len) { fprintf(stderr,"pi_concat out of range\n"); return -1; }
+    unsigned char *pi_next = pkt.h.pi_concat + offset;
 
     // τ_i を取り出す
-    const unsigned char *tau = state_get_tau(me, pkt->h.sid);
+    const unsigned char *tau = state_get_tau(me, pkt.h.sid);
     if (!tau) { fprintf(stderr,"tau not found at R%d\n", idx); return -1; }
 
     // π_i+1 を検証
     size_t n_len;
-    unsigned char *n = concat2(tau, SIG_LEN, pkt->p.rand_val, sizeof(pkt->p.rand_val), &n_len);
+    unsigned char *n = concat2(tau, SIG_LEN, pkt.p.rand_val, sizeof(pkt.p.rand_val), &n_len);
     if (!verify_sig(nodes[nidx].pk, n, n_len, pi_next, SIG_LEN)) {
         free(n); fprintf(stderr,"Verify π%ld failed at R%d\n", nidx, idx); return -1;
     }
@@ -608,12 +593,9 @@ static int router_handle_reverse(unsigned char *frame, size_t frame_cap, Node *n
     printf("Verify π%ld success \n", nidx);
 
     // フレーム再構築(乱数を更新)
-    memcpy(pkt->p.rand_val, me->rand_val, sizeof(me->rand_val));
-    memset(frame, 0, frame_cap);
-    write_l2l3_min(frame, frame_cap);
-    size_t wire_len = build_overlay_setup_resp(frame, frame_cap, pkt);
+    memcpy(pkt.p.rand_val, me->rand_val, sizeof(me->rand_val));
+    size_t wire_len = build_overlay_setup_resp(frame, frame_cap, &pkt);
     printf("Reverse frame wire_len=%zu rand_val updated\n", wire_len);
-    free(pkt);
     return 0;
 }
 
@@ -639,31 +621,19 @@ int main(void) {
     // 最終目的地(dest)はS
     unsigned char dest_addr[4];
     memcpy(dest_addr, nodes[NODES-1].addr, 4);
-    // print_hex("dest_addr", dest_addr, 4);
 
+    // τ0用のデータ
     unsigned char *tau;
     size_t tau_len = SIG_LEN;
-    // unsigned char *pi;
-    // size_t pi_len = SIG_LEN;
-    // unsigned char *tau2;
-    // size_t tau2_len = SIG_LEN;
-
-    // 入力データの初期化
     size_t m_len;
-    unsigned char *m = NULL;// τi-1検証用のデータ
-    // size_t n_len;
-    // unsigned char *n = NULL;// πi署名用のデータ
-    // size_t m2_len;
-    // unsigned char *m2 = NULL;// τ署名用のデータ
+    unsigned char *m = NULL;
 
     printf("======= 経路設定フェーズ =======");
     // ==往路==
     printf("\n===============================往路=================================");
     // クライアントCの処理
     printf("\n=== Node C(R0) ===\n");
-    // 往路の経路設定パケット作成
-    Packet pkt; memset(&pkt, 0, sizeof(pkt));
-
+    Packet pkt; 
     // k_C 公開鍵取り出し & SID=H(k_C)
     unsigned char kC_pub[PUB_LEN];
     get_raw_pub(nodes[0].dh_sk, kC_pub);
@@ -679,80 +649,21 @@ int main(void) {
     memcpy(pkt.p.tau, tau, tau_len);
     pkt.p.tau_len = tau_len;
     print_hex("τ0", tau, tau_len);
-    // pkt.h.pi_concat_len = 0;
 
     // 状態保存（prev=0, next=1 or self）
     state_set(&nodes[0], pkt.h.sid, -1, nodes[1].id, pkt.p.tau, SIG_LEN);
 
-    // ==== メモリ上に L2/L3 + overlay(SETUP_REQ) を構築（送信用）====
+    // ==== メモリに L2/L3 + overlay(SETUP_REQ) を構築（送信用）====
     // 往路の送信フレームを作成
-    unsigned char frame[MAX_PKT]; memset(frame, 0, sizeof(frame));
-    size_t l3end = write_l2l3_min(frame, sizeof(frame));
-    (void)l3end;
+    unsigned char frame[MAX_PKT]; 
+    memset(frame, 0, sizeof(frame));
+    write_l2l3_min(frame, sizeof(frame));
     size_t wire_len = build_overlay_setup_req(frame, sizeof(frame), &pkt);
-    // SIDI(37) + 
+    // SIDI(37) + π長(2) + πリスト(0) + peer_pub(32) + τ長(2) + τ(64) = 137B
     printf("C sending SETUP_REQ (%zu bytes)\n", wire_len);
 
     // 各ノードの処理
     for (int i = 1; i < NODES; i++) {
-        // printf("\n=== Node R%d ===\n", i);
-        // Node *me = &nodes[i];
-        // if (pkt.h.status != SETUP_REQ) {
-        //     die("unexpected status on forward");
-        // }
-        // unsigned char sid_chk[SID_LEN];
-        // hash_sid_from_pub(pkt.p.peer_pub, sid_chk);
-        // if (memcmp(sid_chk, pkt.h.sid, SID_LEN) != 0) {
-        //     die("SID verify failed");
-        // }
-
-        // // 次ホップを決定（直線：最後のノード以外は +1）
-        // // ****本来はdestに基づいて経路設定****
-        // int next_addr = (nodes[i].id < NODES-1) ? (nodes[i+1].id) : nodes[i].id;
-        // //前ホップを決定
-        // // const unsigned char* 
-        // int prev_addr = nodes[i-1].id;
-
-        // // 前ノードの τ_{i-1} を検証
-        // m = concat2(pkt.h.sid, SID_LEN, nodes[i-1].addr, sizeof(nodes[i-1].addr), &m_len);
-        // // print_hex("m = sid||R", m, m_len);
-        // if (!verify_sig(nodes[i-1].pk, m, m_len, pkt.p.tau, pkt.p.tau_len)) {
-        //     printf("Verify τ%d failed\n", i-1);
-        //     return EXIT_FAILURE;
-        // }
-        // printf("Verify τ%d success\n", i-1);
-        // free(m);
-        // // π_i = Sign(sk_i, τ_{i-1} || r_i)
-        // n = concat2(pkt.p.tau, pkt.p.tau_len, nodes[i].rand_val, sizeof(nodes[i].rand_val), &n_len);
-        // sign_data(nodes[i].sk, n, n_len, &pi, &pi_len);
-        // // pkt.h.pi_concat = realloc(pkt.h.pi_concat, pkt.h.pi_concat_len + pi_len);
-        // if (pkt.h.pi_concat_len + pi_len > sizeof(pkt.h.pi_concat)) die("pi_concat overflow");
-        // memcpy(pkt.h.pi_concat + pkt.h.pi_concat_len, pi, pi_len);
-        // pkt.h.pi_concat_len += pi_len;
-        // printf("π%d", i);
-        // print_hex(" ", pi, pi_len);
-        // free(n);
-        // OPENSSL_free(pi);
-
-        // if(me->id != nodes[NODES-1].id) {
-        //     // τ_i = Sign(sk_i, sid||R_i)
-        //     m2 = concat2(pkt.h.sid, SID_LEN, nodes[i].addr, sizeof(nodes[i].addr), &m2_len);
-        //     sign_data(nodes[i].sk, m2, m2_len, &tau2, &tau2_len);
-        //     // pkt.p.tau_len = (uint16_t)tau2_len;
-        //     memcpy(pkt.p.tau, tau2, tau2_len);
-        //     printf("τ%d", i);
-        //     print_hex(" ", pkt.p.tau, tau2_len);
-        //     free(m2);
-        //     OPENSSL_free(tau2);
-        // }
-        // // 状態保存（prev=i-1, next=i+1 or self）
-        // state_set(me, pkt.h.sid, prev_addr, next_addr, pkt.p.tau, tau2_len);
-
-        // // フレームを更新
-        // memset(frame, 0, sizeof(frame));
-        // (void)write_l2l3_min(frame, sizeof(frame));
-        // wire_len = build_overlay_setup_req(frame, sizeof(frame), &pkt);
-        // printf("[DEBUG] R%d built frame, wire_len=%zu\n", i, wire_len);
         if (router_handle_forward(frame, sizeof(frame), nodes, i) != 0) die("forward fail");
     }
 
@@ -760,7 +671,6 @@ int main(void) {
     // printf("\n=== Node S(R%d) ===\n", NODES - 1);
     Node *me = &nodes[NODES-1];
 
-    // Packet *pkt = malloc(sizeof(Packet));
     if (parse_frame_to_pkt(frame, sizeof(frame), &pkt) != 0) {
         fprintf(stderr, "S: parse failed\n");
         // free(pkt);
@@ -800,7 +710,7 @@ int main(void) {
     // ==== SETUP_RESP をパケットに積む（DST_S と pi_concat を格納）====
     // 復路の送信フレームを作成
     memset(frame, 0, sizeof(frame));
-    (void)write_l2l3_min(frame, sizeof(frame));
+    write_l2l3_min(frame, sizeof(frame));
     // printf("a");
     wire_len = build_overlay_setup_resp(frame, sizeof(frame), &pkt);
     printf("S sending SETUP_RESP (%zu bytes)\n", wire_len);
@@ -809,40 +719,6 @@ int main(void) {
     // 復路は逆順に転送
     int cur = nodes[ROUTERS].id;
     while (cur != -1) {
-        // printf("\n=== Node R%d ===\n", cur);
-        // size_t idx = cur + 1;                // π_{i+1} のインデックス
-        // size_t offset = (idx - 1) * SIG_LEN;
-        // if (offset + SIG_LEN > pkt.h.pi_concat_len) {
-        //     die("pi_concat out of range");
-        // }
-        // // printf("offset for π%d: %zu\n", (int)idx, offset);
-        // unsigned char *pi_next = pkt.h.pi_concat + offset; // π_{i+1} の先頭
-        // size_t pi_next_len = SIG_LEN;
-        // // DST_Sを検証
-        // if (!verify_sig(nodes[NODES-1].pk, pkt.h.pi_concat, pkt.h.pi_concat_len, pkt.h.dst_s, pkt.h.dst_s_len)) {
-        //     printf("Verify DST_S failed\n");
-        //     return EXIT_FAILURE;
-        // }
-        // printf("Verify DST_S success\n");
-        // // π_i+1 を検証
-        // const unsigned char *tau = state_get_tau(&nodes[cur], pkt.h.sid);
-        // // size_t tau_len = SIG_LEN;
-        // n = concat2(tau, SIG_LEN, pkt.p.rand_val, sizeof(pkt.p.rand_val), &n_len);
-        // // print_hex("π_next", pi_next, SIG_LEN);
-        // if (!verify_sig(nodes[cur+1].pk, n, n_len, pi_next, pi_next_len)) {
-        //     printf("Verify π%d failed\n", cur+1);
-        //     return EXIT_FAILURE;
-        // }
-        // printf("Verify π%d success\n", cur+1);
-        // free(n);
-        // Node *curN = &nodes[cur];
-        // memcpy(pkt.p.rand_val, curN->rand_val, sizeof(curN->rand_val));//自身の乱数をセット
-        // // frame を再構築
-        // memset(frame, 0, sizeof(frame));
-        // (void)write_l2l3_min(frame, sizeof(frame));
-        // wire_len = build_overlay_setup_resp(frame, sizeof(frame), &pkt);
-        // int prev_addr = state_get_prev(curN, pkt.h.sid);
-        // cur = prev_addr;
         if (router_handle_reverse(frame, sizeof(frame), nodes, cur) != 0) die("reverse fail");
         Node *curN = &nodes[cur];
         cur = state_get_prev(curN, pkt.h.sid);
@@ -870,47 +746,53 @@ int main(void) {
     puts("== 経路設定完了・セッション確立 ==");
 
 
-    // printf("\n======= データ転送フェーズ =======\n");
-    // const char *msg = "hello world";
-    // size_t msg_len = strlen(msg);
-    // printf("C sending plaintext: %s\n", msg);
+    printf("\n======= データ転送フェーズ =======\n");
+    const char *msg = "hello world";
+    size_t msg_len = strlen(msg);
+    printf("C sending plaintext: %s\n", msg);
 
-    // // Cの処理: msgを暗号化して送信パケット作成
-    // memset(&pkt, 0, sizeof(pkt));
-    // unsigned char sid_use[SID_LEN];
-    // get_raw_pub(nodes[0].dh_sk, kC_pub);
-    // hash_sid_from_pub(kC_pub, sid_use);
-    // memcpy(pkt.h.sid, sid_use, SID_LEN);
+    // Cの処理: msgを暗号化して送信パケット作成
+    unsigned char sid_use[SID_LEN];
+    get_raw_pub(nodes[0].dh_sk, kC_pub);
+    hash_sid_from_pub(kC_pub, sid_use);
+    memcpy(pkt.h.sid, sid_use, SID_LEN);
 
-    // pkt.h.status = DATA_TRANS;
-    // memcpy(pkt.h.dest, dest_addr, 4);
+    pkt.h.status = DATA_TRANS;
+    memcpy(pkt.h.dest, dest_addr, 4);
 
-    // aead_encrypt(nodes[0].sess_key, (const unsigned char*)msg, msg_len, pkt.h.sid, pkt.p.iv, pkt.p.ct, pkt.p.tag);
-    // pkt.p.ct_len = msg_len;
+    aead_encrypt(nodes[0].sess_key, (const unsigned char*)msg, msg_len, pkt.h.sid, pkt.p.iv, pkt.p.ct, pkt.p.tag);
+    pkt.p.ct_len = msg_len;
 
-    // // ==== DATA_TRANS をパケットに積む ====
-    // memset(frame, 0, sizeof(frame));
-    // (void)write_l2l3_min(frame, sizeof(frame));
-    // wire_len = build_overlay_data_trans(frame, sizeof(frame), &pkt);
+    // ==== DATA_TRANS をパケットに積む ====
+    memset(frame, 0, sizeof(frame));
+    write_l2l3_min(frame, sizeof(frame));
+    wire_len = build_overlay_data_trans(frame, sizeof(frame), &pkt);
 
-    // // 各ノードの処理: state.next で転送
-    // cur = nodes[0].id;
-    // while (cur != NODES-1) {
-    //     Node *me = &nodes[cur];
-    //     // printf("%s forwarding packet...\n", me->name);
-    //     printf("%s -> ", me->name);
-    //     int next_addr = state_get_next(me, pkt.h.sid);
-    //     if (next_addr < 0) {
-    //         die("no next hop in data forward");
-    //     }
-    //     cur = next_addr;
-    // }
-    // // Sの処理: 復号
-    // printf("S(R%d)\n", cur);
-    // unsigned char plain[MAX_PTXT];
-    // if (!aead_decrypt(nodes[NODES-1].sess_key, pkt.p.ct, pkt.p.ct_len, pkt.h.sid, pkt.p.iv, pkt.p.tag, plain))
-    //     die("GCM auth fail at S");
-    // printf("%s got plaintext: %.*s\n", nodes[NODES-1].name, (int)pkt.p.ct_len, plain);
+    // 各ノードの処理: state.next で転送
+    cur = nodes[0].id;
+    while (cur != NODES-1) {
+        Node *me = &nodes[cur];
+        if (parse_frame_to_pkt(frame, sizeof(frame), &pkt) != 0) {
+            fprintf(stderr, "parse failed\n");
+            return -1;
+        }
+        printf("%s -> ", me->name);
+        int next_addr = state_get_next(me, pkt.h.sid);
+        if (next_addr < 0) {
+            die("no next hop in data forward");
+        }
+        cur = next_addr;
+    }
+    // Sの処理: 復号
+    printf("S(R%d)\n", cur);
+    unsigned char plain[MAX_PTXT];
+    if (parse_frame_to_pkt(frame, sizeof(frame), &pkt) != 0) {
+        fprintf(stderr, "S: parse failed\n");
+        return -1;
+    }
+    if (!aead_decrypt(nodes[NODES-1].sess_key, pkt.p.ct, pkt.p.ct_len, pkt.h.sid, pkt.p.iv, pkt.p.tag, plain))
+        die("GCM auth fail at S");
+    printf("%s got plaintext: %.*s\n", nodes[NODES-1].name, (int)pkt.p.ct_len, plain);
 
     // 後処理
     for (int i=0;i<NODES;i++) {
