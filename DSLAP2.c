@@ -146,10 +146,26 @@ static EVP_PKEY* gen_x25519_keypair(void) {
     return p;
 }
 
+static void get_raw_pub(const EVP_PKEY *pkey, unsigned char pub[PUB_LEN]) {
+    size_t len = PUB_LEN;
+    if (EVP_PKEY_get_raw_public_key(pkey, pub, &len) <= 0 || len != PUB_LEN) die("get_raw_public_key");
+}
+
 static EVP_PKEY* import_x25519_pub(const unsigned char *pub) {
     EVP_PKEY *p = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, pub, PUB_LEN);
     if (!p) die("new_raw_public_key");
     return p;
+}
+
+// X25519 共有秘密の導出
+static void derive_shared(const EVP_PKEY *my_sk, const EVP_PKEY *peer_pub, unsigned char sec[SEC_LEN]) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new((EVP_PKEY*)my_sk, NULL);
+    if (!ctx) die("derive ctx");
+    if (EVP_PKEY_derive_init(ctx) <= 0) die("derive_init");
+    if (EVP_PKEY_derive_set_peer(ctx, (EVP_PKEY*)peer_pub) <= 0) die("set_peer");
+    size_t outlen = SEC_LEN;
+    if (EVP_PKEY_derive(ctx, sec, &outlen) <= 0 || outlen != SEC_LEN) die("derive");
+    EVP_PKEY_CTX_free(ctx);
 }
 
 static EVP_PKEY* gen_ed25519_keypair(void) {
@@ -176,11 +192,6 @@ static void hash_sid_from_pub(const unsigned char *pub, unsigned char sid[SID_LE
     SHA256(pub, PUB_LEN, sid);
 }
 
-static void get_raw_pub(const EVP_PKEY *pkey, unsigned char pub[PUB_LEN]) {
-    size_t len = PUB_LEN;
-    if (EVP_PKEY_get_raw_public_key(pkey, pub, &len) <= 0 || len != PUB_LEN) die("get_raw_public_key");
-}
-
 static unsigned char* concat2(const unsigned char *a, size_t alen, const unsigned char *b, size_t blen, size_t *outlen) {
     *outlen = alen + blen;
     unsigned char *buf = malloc(*outlen);
@@ -188,17 +199,6 @@ static unsigned char* concat2(const unsigned char *a, size_t alen, const unsigne
     memcpy(buf, a, alen);
     memcpy(buf + alen, b, blen);
     return buf;
-}
-
-// X25519 共有秘密の導出
-static void derive_shared(const EVP_PKEY *my_sk, const EVP_PKEY *peer_pub, unsigned char sec[SEC_LEN]) {
-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new((EVP_PKEY*)my_sk, NULL);
-    if (!ctx) die("derive ctx");
-    if (EVP_PKEY_derive_init(ctx) <= 0) die("derive_init");
-    if (EVP_PKEY_derive_set_peer(ctx, (EVP_PKEY*)peer_pub) <= 0) die("set_peer");
-    size_t outlen = SEC_LEN;
-    if (EVP_PKEY_derive(ctx, sec, &outlen) <= 0 || outlen != SEC_LEN) die("derive");
-    EVP_PKEY_CTX_free(ctx);
 }
 
 // AES-GCM暗号化
@@ -321,7 +321,7 @@ const unsigned char* state_get_tau(const Node *n, const unsigned char sid[SID_LE
 
 
 //========= オーバーレイ領域ヘッダ & ペイロード=========
-static size_t overlay_header_footprint(void) { return SID_LEN + 1 + 4; }//固定へッダ長
+static size_t overlay_header_footprint(void) { return SID_LEN + 1 + 1 + 4; }//固定へッダ長
 
 // L2/L3 ダミーを埋めて最小 IPv4 ヘッダ(IHL = 5)作成
 static size_t write_l2l3_min(unsigned char *buf, size_t buf_cap) {
@@ -353,7 +353,7 @@ static size_t l3_overlay_offset(const unsigned char *l2) {
 // SETUP_REQ を 34B(=L3末) から書く
 static size_t build_overlay_setup_req(unsigned char *l2, size_t cap, const Packet *pkt) {
     size_t off = l3_overlay_offset(l2);
-    size_t need = off + overlay_header_footprint() + 2 + PUB_LEN + 2;
+    size_t need = off + overlay_header_footprint() + (pkt->h.idx - 1) * SIG_LEN + SIG_LEN + PUB_LEN;
     if (cap < need) die("cap too small (setup req)");
     unsigned char *p = l2 + off; //現在の位置 ＋ L2L3オフセット
     // ヘッダ
@@ -372,7 +372,7 @@ static size_t build_overlay_setup_req(unsigned char *l2, size_t cap, const Packe
 // SETUP_RESP を書く（DST_S/πリスト付き）
 static size_t build_overlay_setup_resp(unsigned char *l2, size_t cap, const Packet *pkt) {
     size_t off = l3_overlay_offset(l2);
-    size_t need = off + overlay_header_footprint() + PUB_LEN + 2 + SIG_LEN;
+    size_t need = off + overlay_header_footprint() + MAX_PI + SIG_LEN + 4 + PUB_LEN;
     if (cap < need) die("cap too small (setup resp)");
     unsigned char *p = l2 + off;
     // ヘッダ
