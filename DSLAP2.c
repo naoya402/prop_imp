@@ -146,11 +146,13 @@ static EVP_PKEY* gen_x25519_keypair(void) {
     return p;
 }
 
+// DH秘密鍵から公開鍵を取得
 static void get_raw_pub(const EVP_PKEY *pkey, unsigned char pub[PUB_LEN]) {
     size_t len = PUB_LEN;
     if (EVP_PKEY_get_raw_public_key(pkey, pub, &len) <= 0 || len != PUB_LEN) die("get_raw_public_key");
 }
 
+// 公開鍵のインポート
 static EVP_PKEY* import_x25519_pub(const unsigned char *pub) {
     EVP_PKEY *p = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, pub, PUB_LEN);
     if (!p) die("new_raw_public_key");
