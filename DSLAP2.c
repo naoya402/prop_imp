@@ -15,6 +15,7 @@
 #define ETH_LEN 14     // VLAN 無し
 #define IP_LEN  20
 #define SID_LEN 32
+#define CIRC_ID_LEN 2
 #define PUB_LEN 32
 #define SEC_LEN 32
 #define KEY_LEN 32
@@ -53,6 +54,7 @@ typedef struct {
 // SID(32) | STATUS(1) | DEST(4)
 typedef struct {
     unsigned char sid[SID_LEN];  // セッションID
+    unsigned char circ_id[CIRC_ID_LEN];      // サーキットID
     uint8_t status;              // ステータス (SETUP_REQ, SETUP_RESP, DATA_TRANS)
     uint8_t idx;                 // ルータインデックス (0=クライアント, NODES-1=サーバ)
     unsigned char dest[4];       // 宛先アドレス
@@ -111,6 +113,8 @@ typedef struct {
     struct {
         int used;
         unsigned char sid[SID_LEN];
+        unsigned char precirc_id[CIRC_ID_LEN]; // サーキットID
+        unsigned char nexcirc_id[CIRC_ID_LEN]; // サーキットID
         char prev_addr; //本来アドレスだが便宜上ノードID
         char next_addr; //本来アドレスだが便宜上ノードID
         unsigned char tau[SIG_LEN];   // τi
@@ -280,11 +284,13 @@ static void node_free(Node *n) {
 }
 
 // ステート操作
-static void state_set(Node *n, const unsigned char sid[SID_LEN], char prev_addr, int next_addr, const unsigned char *tau, size_t tau_len) {
+static void state_set(Node *n, const unsigned char sid[SID_LEN], unsigned char precirc_id[CIRC_ID_LEN], unsigned char nexcirc_id[CIRC_ID_LEN], unsigned char prev_addr, int next_addr, const unsigned char *tau, size_t tau_len) {
     for (int i=0;i<MAX_STATE;i++) {
         if (!n->state[i].used) {
             n->state[i].used = 1;
             memcpy(n->state[i].sid, sid, SID_LEN);
+            memcpy(n->state[i].precirc_id, precirc_id, CIRC_ID_LEN);
+            memcpy(n->state[i].nexcirc_id, nexcirc_id, CIRC_ID_LEN);
             n->state[i].prev_addr = prev_addr;
             n->state[i].next_addr = next_addr;
             if (tau && tau_len > 0) {
@@ -323,7 +329,7 @@ const unsigned char* state_get_tau(const Node *n, const unsigned char sid[SID_LE
 
 
 //========= オーバーレイ領域ヘッダ & ペイロード=========
-static size_t overlay_header_footprint(void) { return SID_LEN + 1 + 1 + 4; }//固定へッダ長
+static size_t overlay_header_footprint(void) { return SID_LEN + CIRC_ID_LEN + 1 + 1 + 4; }//固定へッダ長
 
 // L2/L3 ダミーを埋めて最小 IPv4 ヘッダ(IHL = 5)作成
 static size_t write_l2l3_min(unsigned char *buf, size_t buf_cap) {
@@ -360,6 +366,7 @@ static size_t build_overlay_setup_req(unsigned char *l2, size_t cap, const Packe
     unsigned char *p = l2 + off; //現在の位置 ＋ L2L3オフセット
     // ヘッダ
     memcpy(p, pkt->h.sid, SID_LEN); p += SID_LEN;
+    memcpy(p, pkt->h.circ_id, CIRC_ID_LEN); p += CIRC_ID_LEN;
     *p++ = pkt->h.status;
     *p++ = pkt->h.idx;
     memcpy(p, pkt->h.dest, 4); p += 4;
@@ -379,6 +386,7 @@ static size_t build_overlay_setup_resp(unsigned char *l2, size_t cap, const Pack
     unsigned char *p = l2 + off;
     // ヘッダ
     memcpy(p, pkt->h.sid, SID_LEN); p += SID_LEN;
+    memcpy(p, pkt->h.circ_id, CIRC_ID_LEN); p += CIRC_ID_LEN;
     *p++ = pkt->h.status;
     *p++ = pkt->h.idx;
     // printf("R%d\n", pkt->h.idx);
@@ -401,6 +409,7 @@ static size_t build_overlay_data_trans(unsigned char *l2, size_t cap, const Pack
     unsigned char *p = l2 + off;
     // ヘッダ
     memcpy(p, pkt->h.sid, SID_LEN); p += SID_LEN;
+    memcpy(p, &pkt->h.circ_id, 1); p += CIRC_ID_LEN;
     *p++ = pkt->h.status;
     *p++ = pkt->h.idx;
     memcpy(p, pkt->h.dest, 4); p += 4;
@@ -424,6 +433,7 @@ static int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Pack
     
     //固定ヘッダ
     memcpy(pkt->h.sid, p, SID_LEN); p += SID_LEN;
+    memcpy(pkt->h.circ_id, p, CIRC_ID_LEN); p += CIRC_ID_LEN;
     pkt->h.status = *p++;
     pkt->h.idx = *p++;
     memcpy(pkt->h.dest, p, 4); p += 4;
@@ -496,6 +506,11 @@ static int router_handle_forward(unsigned char *frame, size_t frame_cap, Node *n
         return -1;
     }
 
+    unsigned char precirc_id[CIRC_ID_LEN]; 
+    memcpy(precirc_id, pkt.h.circ_id, CIRC_ID_LEN);
+    // 新しいサーキットIDをランダム生成
+    RAND_bytes(pkt.h.circ_id, CIRC_ID_LEN);
+
     // 次ホップを決定（直線：最後のノード以外は +1）
     // ****本来はdestに基づいて経路設定****
     int next_addr = (me->id < NODES-1) ? (me->id + 1) : me->id;
@@ -544,7 +559,7 @@ static int router_handle_forward(unsigned char *frame, size_t frame_cap, Node *n
     pkt.h.idx++;
 
     // ステート保存（prev=前ホップアドレス, next=次ホップアドレス or 自身）
-    state_set(me, pkt.h.sid, prev_addr, next_addr, pkt.p.tau, SIG_LEN);
+    state_set(me, pkt.h.sid, precirc_id, pkt.h.circ_id, prev_addr, next_addr, pkt.p.tau, SIG_LEN);
 
     // フレーム再構築
     size_t wire_len = build_overlay_setup_req(frame, frame_cap, &pkt);
@@ -562,6 +577,16 @@ static int router_handle_reverse(unsigned char *frame, size_t frame_cap, Node *n
     int idx = pkt.h.idx;
     printf("\n=== Node R%d ===\n", idx);
     Node *me = &nodes[idx];
+
+    if (pkt.h.status != SETUP_RESP) { fprintf(stderr,"unexpected status\n"); return -1; }
+
+    unsigned char precirc_id[CIRC_ID_LEN];
+    memcpy(precirc_id, pkt.h.circ_id, CIRC_ID_LEN);
+    if (memcmp(precirc_id, me->state[0].nexcirc_id, CIRC_ID_LEN) != 0) {// 最初のステートだけ見てサーキットIDを比較
+        fprintf(stderr,"Circuit ID mismatch\n");
+        return -1;
+    }
+
     // DST_Sを検証
     // if (!verify_sig(nodes[NODES-1].pk, pkt.h.pi_concat, pkt.h.pi_concat_len, pkt.h.dst_s, SIG_LEN)) {
     if (!verify_sig(nodes[NODES-1].pk, pkt.h.pi_concat, MAX_PI, pkt.h.dst_s, SIG_LEN)) {
@@ -597,6 +622,7 @@ static int router_handle_reverse(unsigned char *frame, size_t frame_cap, Node *n
     pkt.h.idx--;
 
     // フレーム再構築(乱数を更新)
+    memcpy(pkt.h.circ_id, me->state[0].precirc_id, CIRC_ID_LEN);
     memcpy(pkt.p.rand_val, me->rand_val, sizeof(me->rand_val));
     size_t wire_len = build_overlay_setup_resp(frame, frame_cap, &pkt);
     // printf("Reverse frame wire_len=%zu rand_val updated\n", wire_len);
@@ -609,17 +635,12 @@ int main(void) {
 
     // 初期化
     Node nodes[NODES];
-    node_init(&nodes[0], 0);//, "C(R0)");
-    nodes[0].dh_sk = gen_x25519_keypair();
-    for (int i=1;i<NODES-1;i++) {
-        // char n_name[8];
-        // snprintf(n_name, sizeof(n_name), "R%d", i);
-        node_init(&nodes[i], i);//, n_name);
-        // printf("%s\n", nodes[i].name);
+    // node_init(&nodes[0], 0);//, "C(R0)");
+    for (int i=0;i<NODES;i++) {
+        node_init(&nodes[i], i);
     }
-    // char s_name[8];
-    // snprintf(s_name, sizeof(s_name), "S(R%d)", NODES-1);
-    node_init(&nodes[NODES-1], NODES-1);//, s_name);
+    // node_init(&nodes[NODES-1], NODES-1);
+    nodes[0].dh_sk = gen_x25519_keypair();
     nodes[NODES-1].dh_sk = gen_x25519_keypair();
 
     // 最終目的地(dest)はS
@@ -644,6 +665,8 @@ int main(void) {
     get_raw_pub(nodes[idx].dh_sk, kC_pub);
     hash_sid_from_pub(kC_pub, pkt.h.sid);
     print_hex("SID(C)=H(kC)", pkt.h.sid, SID_LEN);
+    // サーキットIDを生成
+    RAND_bytes(pkt.h.circ_id, CIRC_ID_LEN);
     pkt.h.status = SETUP_REQ;
     memcpy(pkt.h.dest, dest_addr, 4);
     memcpy(pkt.p.peer_pub, kC_pub, PUB_LEN); // P に k_C を格納
@@ -655,7 +678,10 @@ int main(void) {
     // print_hex("τ0", tau, tau_len);
 
     // 状態保存（prev=0, next=1 or self）
-    state_set(&nodes[idx], pkt.h.sid, -1, nodes[idx + 1].id, pkt.p.tau, SIG_LEN);
+    unsigned char precirc_id[CIRC_ID_LEN];
+    //前のサーキットがないので0クリア
+    memset(precirc_id, 0, CIRC_ID_LEN);
+    state_set(&nodes[idx], pkt.h.sid, precirc_id, pkt.h.circ_id, -1, nodes[idx + 1].id, pkt.p.tau, SIG_LEN);
 
     // 次のノードの位置を設定
     pkt.h.idx = 1;
@@ -702,6 +728,7 @@ int main(void) {
     // ここでsidに紐づけてpi_concatを保存
 
     //復路の経路設定パケット作成
+    memcpy(pkt.h.circ_id, me->state[0].precirc_id, CIRC_ID_LEN); // 往路の最後のサーキットIDを流用
     pkt.h.status = SETUP_RESP;
     pkt.h.idx--;
     pkt.h.idx--; // pi_concatサイズ計算のため加算しすぎたidxをもどす
@@ -719,6 +746,7 @@ int main(void) {
     // 復路の送信フレームを作成
     memset(frame, 0, sizeof(frame));
     write_l2l3_min(frame, sizeof(frame));
+    print_hex("SID(S)", pkt.h.sid, SID_LEN);
     wire_len = build_overlay_setup_resp(frame, sizeof(frame), &pkt);
     printf("S sending SETUP_RESP (%zu bytes)\n", wire_len);
 
