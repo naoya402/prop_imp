@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "err.h": "c"
+        "err.h": "c",
+        "sha.h": "c"
     }
 }
