@@ -3,11 +3,24 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
+#include <zlib.h>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/err.h>
+
+#include <iostream>
+#include <limits.h>
+#include <ctime>
+#include <fstream>
+#include <vector>
+
+#include "groupsig/groupsig.h"
+#include "groupsig/gml.h"
+#include "groupsig/crl.h"
+#include "groupsig/kty04.h"
+#include "groupsig/message.h"
 
 #define ROUTERS 4
 #define NODES   (ROUTERS+2)
@@ -30,6 +43,10 @@
 #define MAX_STATE  8
 
 typedef enum { SETUP_REQ = 1, SETUP_RESP = 2, DATA_TRANS = 3 } Status;
+ 
+// ポリシー
+const char *policy[] = {"attack", "leak", "bomb", "hello"};
+const int POLICY_COUNT = sizeof(policy) / sizeof(policy[0]);
 
 // ========= L2/L3 (Ether/IPv4) ヘッダ =========
 typedef struct {
@@ -58,7 +75,7 @@ typedef struct {
     unsigned char sid[SID_LEN];  // セッションID
     unsigned char cid[CID_LEN];      // サーキットID
     uint8_t status;              // ステータス (SETUP_REQ, SETUP_RESP, DATA_TRANS)
-    uint8_t idx;                 // ルータインデックス (0=クライアント, NODES-1=サーバ)
+    uint8_t idx;                 // ルータインデックス (0=センダー, NODES-1=レシーバ)
     // unsigned char dest[4];       // 宛先アドレス
 
     // SETUP_REQ
@@ -97,7 +114,7 @@ typedef struct {
 } Packet;
 
 typedef struct {
-    int id; // ノードID (今回は便宜上0=クライアント, NODES-1=サーバ)
+    int id; // ノードID (今回は便宜上0=センダー, NODES-1=レシーバ)
     // char name[8];
     unsigned char addr[4];
     unsigned char rand_val[4];
@@ -150,21 +167,6 @@ static void print_hex(const char *label, const unsigned char *buf, size_t len) {
     for (size_t i = 0; i < len; i++) printf("%02x", buf[i]);
     printf("\n");
 }
-
-// static void load_directory(Node *nodes) {//いらんかも
-//     // 実際にはファイルから読み込む想定
-//     for (int i = 1; i < NODES; i++) {
-
-
-//         // 公開鍵をファイルから読み込む (dhX_pub.pem)
-//         char fname[32];
-//         sprintf(fname, "dh%d_pub.pem", i);
-//         FILE *fp = fopen(fname, "r");
-//         if (!fp) die("cannot open pubkey file");
-//         PEM_read_PUBKEY(fp, &nodes[i].dh_pk, NULL, NULL);
-//         fclose(fp);
-//     }
-// }
 
 static EVP_PKEY* gen_x25519_keypair(void) {
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
@@ -226,7 +228,7 @@ static void hash_sid_from_pub(const unsigned char *pub, unsigned char sid[SID_LE
 
 static unsigned char* concat2(const unsigned char *a, size_t alen, const unsigned char *b, size_t blen, size_t *outlen) {
     *outlen = alen + blen;
-    unsigned char *buf = malloc(*outlen);
+    unsigned char *buf = (unsigned char*)malloc(*outlen);
     if (!buf) die("malloc failed");
     memcpy(buf, a, alen);
     memcpy(buf + alen, b, blen);
@@ -342,13 +344,13 @@ static int state_get_next(const Node *n, const unsigned char sid[SID_LEN]) {
     return -1;
 }
 
-// static int state_get_prev(const Node *n, const unsigned char sid[SID_LEN]) {
-//     for (int i=0;i<MAX_STATE;i++) {
-//         if (n->state[i].used && memcmp(n->state[i].sid, sid, SID_LEN)==0)
-//             return n->state[i].prev_addr;
-//     }
-//     return -1;
-// }
+static int state_get_prev(const Node *n, const unsigned char sid[SID_LEN]) {
+    for (int i=0;i<MAX_STATE;i++) {
+        if (n->state[i].used && memcmp(n->state[i].sid, sid, SID_LEN)==0)
+            return n->state[i].prev_addr;
+    }
+    return -1;
+}
 
 const unsigned char* state_get_tau(const Node *n, const unsigned char sid[SID_LEN]) {
     for (int i=0;i<MAX_STATE;i++) {
@@ -724,13 +726,75 @@ static int router_handle_reverse(unsigned char *frame, size_t frame_cap, Node *n
     return 0;
 }
 
+// 鍵をファイルに保存
+int save_key_to_file(const char *path, groupsig_key_t *key,
+                     int (*export_func)(byte_t **, uint32_t *, groupsig_key_t *)) {
+    byte_t *bytes = NULL;
+    uint32_t size = 0;
+
+    if (export_func(&bytes, &size, key) != IOK) {
+        fprintf(stderr, "Key export failed: %s\n", path);
+        return -1;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        perror("fopen");
+        free(bytes);
+        return -1;
+    }
+
+    fwrite(bytes, 1, size, f);
+    fclose(f);
+    free(bytes);
+    return 0;
+}
+
+// 鍵をファイルから読み込み
+groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme,
+                                   groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror("fopen");
+        return NULL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    rewind(f);
+
+    byte_t *buf = (byte_t *)malloc(len);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+
+    fread(buf, 1, len, f);
+    fclose(f);
+
+    groupsig_key_t *key = import_func(scheme, buf, len);
+    free(buf);
+    return key;
+}
+
+int apply_policy_contract(const char *msg) {
+    if (!msg) return 0;
+    for (int i = 0; i < POLICY_COUNT; i++) {
+        if (strstr(msg, policy[i]) != NULL) {
+            // 禁止ワード表示(英語で)
+            printf("Detected: '%s'\n", policy[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
 
 int main(void) {
     RAND_load_file("/dev/urandom", 32);
 
     // 初期化
     Node nodes[NODES];
-    // node_init(&nodes[0], 0);//, "C(R0)");
+    // node_init(&nodes[0], 0);//, "S(R0)");
     for (int i=0;i<NODES;i++) {
         node_init(&nodes[i], i);
     }
@@ -745,18 +809,39 @@ int main(void) {
     unsigned char *m = NULL;
 
     printf("======= 経路設定フェーズ =======");
-    // ==往路==
     printf("\n===============================往路=================================");
-    // クライアントCの処理
-    printf("\n=== Node C(R0) ===\n");
+    // センダーSの処理
+    printf("\n=== Node S(R0) ===\n");
     Packet pkt; 
     // k_C 公開鍵取り出し & SID=H(k_C)
     unsigned char kC_pub[PUB_LEN];
     int idx = 0;
     Node *me = &nodes[idx];
     get_raw_pub(me->dh_sk, kC_pub);
-    hash_sid_from_pub(kC_pub, pkt.h.sid);
-    print_hex("SID(C)=H(kC)", pkt.h.sid, SID_LEN);
+    // print_hex("kC_pub", kC_pub, PUB_LEN);
+    //グループ署名生成
+    groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));
+    groupsig_key_t *grpkey = load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);
+    groupsig_key_t *memkey = load_key_from_file("memkey.pem", GROUPSIG_KTY04_CODE, groupsig_mem_key_import);
+
+    // message_t *gsm = message_from_string((char *)kC_pub);
+    message_t *gsm = message_from_bytes(kC_pub, PUB_LEN);
+    // print_hex("gsm", gsm->bytes, gsm->length);
+    groupsig_signature_t *sig = groupsig_signature_init(GROUPSIG_KTY04_CODE);
+    groupsig_sign(sig, gsm, memkey, grpkey, UINT_MAX);
+
+    // --- 署名をバイナリにエクスポート ---
+    byte_t *sig_bytes = NULL;
+    uint32_t sig_size = 0;
+    groupsig_signature_export(&sig_bytes, &sig_size, sig);
+    printf("Exported signature length: %u bytes\n", sig_size);
+    
+   
+    size_t sid_len;
+    unsigned char *sid = concat2(kC_pub, PUB_LEN, sig_bytes, sig_size, &sid_len);
+    // print_hex("sid", sid, sid_len);
+    hash_sid_from_pub(sid, pkt.h.sid);
+    print_hex("SID(S)=H(kC)", pkt.h.sid, SID_LEN);
     // サーキットIDを生成
     RAND_bytes(pkt.h.cid, CID_LEN);
     pkt.h.status = SETUP_REQ;
@@ -782,7 +867,7 @@ int main(void) {
         unsigned char ci[SEG_LEN];
         unsigned char iv[IV_LEN], tag[TAG_LEN];//, ci[SEG_LEN];
         aead_encrypt(me->k[i], ap, ap_len, pkt.h.sid, iv, ci, tag);
-        // // リングバッファ(容量=ROUTERS)に c_iやタグを循環的に挿入
+        // // リングバッファもどき(容量=ROUTERS)に c_iやタグを循環的に挿入
         size_t offset = (size_t)((i-1) % (ROUTERS + 1)) * (SEG_LEN + TAG_LEN + IV_LEN);//ROUTERS + 1では経路長が漏洩するため適切な固定長(12など)にする
         // print_hex("c_i||tag_i||iv_i", t2, t2_len);
 
@@ -823,40 +908,48 @@ int main(void) {
     write_l2l3_min(frame, sizeof(frame));
     size_t wire_len = build_overlay_setup_req(frame, sizeof(frame), &pkt);
     // SID(36) + seg_list(40*5) + πリスト(0) + peer_pub(32) + τ(64) = 332B
-    printf("C sending SETUP_REQ (%zu bytes)\n", wire_len);
+    printf("S sending SETUP_REQ (%zu bytes)\n", wire_len);
 
     // 各ノードの処理
     for (int i = 1; i < NODES; i++) {
         if (router_handle_forward(frame, sizeof(frame), nodes) != 0) die("forward fail");
     }
 
-    // サーバSの処理
-    // printf("\n=== Node S(R%d) ===\n", NODES - 1);
+    // レシーバRの処理
+    // printf("\n=== Node R(R%d) ===\n", NODES - 1);
     me = &nodes[NODES-1];
 
     if (parse_frame_to_pkt(frame, sizeof(frame), &pkt) != 0) {
-        fprintf(stderr, "S: parse failed\n");
+        fprintf(stderr, "R: parse failed\n");
         return -1;
     }
-    // k_S を用意して共有鍵 k を計算
-    unsigned char kS_pub[PUB_LEN];
-    get_raw_pub(me->dh_sk, kS_pub);
 
-    EVP_PKEY *C_pub = import_x25519_pub(pkt.p.peer_pub);
+    //　グループ署名の検証
+    // 検証側
+    unsigned char *decompressed = NULL;
+    // decompress_zlib(compressed, compressed_len, &decompressed, sig_size);
+    printf("Decompressed: %u / %u bytes\n", sig_size, sig_size);
+
+    uint8_t valid;
+    message_t *ppp = message_from_bytes(pkt.p.peer_pub, PUB_LEN);
+    groupsig_verify(&valid, sig, ppp, grpkey);
+    printf("TGsig verification: %s\n", valid ? "valid" : "invalid");
+
+    // Rもkを計算
+    EVP_PKEY *S_pub = import_x25519_pub(pkt.p.peer_pub);
     unsigned char shared[SEC_LEN];
-    derive_shared(me->dh_sk, C_pub, shared);
-    EVP_PKEY_free(C_pub);
-
+    derive_shared(me->dh_sk, S_pub, shared);
+    EVP_PKEY_free(S_pub);
     memcpy(me->sess_key, shared, KEY_LEN);
     me->has_sess = 1;
-    print_hex("S derived k", me->sess_key, KEY_LEN);
-
+    print_hex("R derived k", me->sess_key, KEY_LEN);
+    
     printf("\n===============================復路=================================");
-    // サーバSの処理
-    printf("\n=== Node S(R%d) ===\n", NODES - 1);
-
+    // レシーバRの処理
+    printf("\n=== Node R(R%d) ===\n", NODES - 1);
+    
     // ここでsidに紐づけてpi_concatを保存
-
+    
     //復路の経路設定パケット作成
     memcpy(pkt.h.cid, me->state[0].precid, CID_LEN); // 往路の最後のサーキットIDを流用
     pkt.h.status = SETUP_RESP;
@@ -867,22 +960,25 @@ int main(void) {
     size_t rho_len = SIG_LEN;
     unsigned char rho[SIG_LEN];
     m = concat2(pkt.h.sid, SID_LEN, pkt.h.pi_concat, MAX_PI, &m_len);
+    // print_hex("m for rho", m, m_len);
     sign_data(me->sk, m, m_len, rho, &rho_len);
     free(m);
-    // printf("index: %d\n", pkt.h.idx + 1);
     memcpy(pkt.h.rho[(pkt.h.idx + 1) % 2], rho, SIG_LEN); // ρリストは2つ分だけ保持
     // print_hex("ρ", pkt.h.rho, SIG_LEN*2);
 
-    memcpy(pkt.p.peer_pub, kS_pub, PUB_LEN);
+    // k_R を用意
+    unsigned char kR_pub[PUB_LEN];
+    get_raw_pub(me->dh_sk, kR_pub);
+    memcpy(pkt.p.peer_pub, kR_pub, PUB_LEN);
     memcpy(pkt.p.rand_val, me->rand_val, sizeof(me->rand_val));
 
     // ==== SETUP_RESP をパケットに積む（DST_S と pi_concat を格納）====
     // 復路の送信フレームを作成
     memset(frame, 0, sizeof(frame));
     write_l2l3_min(frame, sizeof(frame));
-    // print_hex("SID(S)", pkt.h.sid, SID_LEN);
+    // print_hex("SID(R)", pkt.h.sid, SID_LEN);
     wire_len = build_overlay_setup_resp(frame, sizeof(frame), &pkt);
-    printf("S sending SETUP_RESP (%zu bytes)\n", wire_len);
+    printf("R sending SETUP_RESP (%zu bytes)\n", wire_len);
 
     // 各ノードの処理
     // 復路は逆順に転送
@@ -893,22 +989,22 @@ int main(void) {
         // cur = state_get_prev(curN, pkt.h.sid);
     }
 
-    // クライアントCの処理
+    // センダーSの処理
     if (parse_frame_to_pkt(frame, sizeof(frame), &pkt) != 0) {
-        fprintf(stderr, "C: parse failed\n");
+        fprintf(stderr, "S: parse failed\n");
         // free(pkt);
         return -1;
     }
-    // Cもkを計算
+    // Sもkを計算
     me = &nodes[0];
-    EVP_PKEY *S_pub = import_x25519_pub(pkt.p.peer_pub);
+    EVP_PKEY *R_pub = import_x25519_pub(pkt.p.peer_pub);
     unsigned char kC_shared[SEC_LEN];
-    derive_shared(me->dh_sk, S_pub, kC_shared);
-    EVP_PKEY_free(S_pub);
+    derive_shared(me->dh_sk, R_pub, kC_shared);
+    EVP_PKEY_free(R_pub);
 
     memcpy(me->sess_key, kC_shared, KEY_LEN);
     me->has_sess = 1;
-    print_hex("C derived k", me->sess_key, KEY_LEN);
+    print_hex("S derived k", me->sess_key, KEY_LEN);
 
     // PKIから生成した鍵と同じか確認
     if (memcmp(me->sess_key, nodes[0].k[NODES-1], KEY_LEN) != 0) {
@@ -919,9 +1015,9 @@ int main(void) {
     printf("\n======= データ転送フェーズ =======\n");
     const char *msg = "hello world";
     size_t msg_len = strlen(msg);
-    printf("C sending plaintext: %s\n", msg);
+    printf("S sending plaintext: %s\n", msg);
 
-    // Cの処理: msgを暗号化して送信パケット作成
+    // Sの処理: msgを暗号化して送信パケット作成
     unsigned char sid_use[SID_LEN];
     get_raw_pub(nodes[0].dh_sk, kC_pub);
     hash_sid_from_pub(kC_pub, sid_use);
@@ -952,17 +1048,124 @@ int main(void) {
         }
         cur = next_addr;
     }
-    // Sの処理: 復号
-    printf("S(R%d)\n", cur);
+    // Rの処理: 復号
+    printf("R(R%d)\n", cur);
     unsigned char plain[MAX_PTXT];
     if (parse_frame_to_pkt(frame, sizeof(frame), &pkt) != 0) {
-        fprintf(stderr, "S: parse failed\n");
+        fprintf(stderr, "R: parse failed\n");
         return -1;
     }
     if (!aead_decrypt(nodes[NODES-1].sess_key, pkt.p.ct, pkt.p.ct_len, pkt.h.sid, pkt.p.iv, pkt.p.tag, plain))
-        die("GCM auth fail at S");
-    printf("S(R%d) got plaintext: %.*s\n", cur, (int)pkt.p.ct_len, plain);
+        die("GCM auth fail at R");
 
+    printf("R(R%d) got plaintext: %.*s\n", cur, (int)pkt.p.ct_len, plain);
+
+    int blocked = apply_policy_contract((const char *)plain);
+
+    if (blocked) {
+        printf("\n======= 責任追跡フェーズ =======\n");
+        // Rの処理
+        // トラフィックを通報
+        // 本来は保存したS_pubとsigを使う
+        // S_pub,sig,pkt,plain,node[NODES-1].sess_key,pi_concat,state_get_prev(me,pkt.h.sid),sigma_s
+
+
+        // 検証者Vの処理
+        // 通報の正当性検証
+        unsigned char k_S[PUB_LEN];
+        memcpy(k_S, kC_pub, PUB_LEN); // Sの公開鍵
+        // 1) sigma 検証 (R_pub は known)
+        if (!ed25519_verify(R_pub, payload, payload_len, sigma, siglen)) {
+            fprintf(stderr, "Report signature invalid\n");
+            return -1;
+        }
+
+        // 2) 通報パケットをパース
+        
+
+        // 3) SID 再計算: 例 -> SID = SHA256( S_pub ) or whatever your scheme uses
+        unsigned char sid_chk[SID_LEN];
+        // --- 署名をバイナリにエクスポート ---
+        // byte_t *sig_bytes = NULL;
+        // uint32_t sig_size = 0;
+        groupsig_signature_export(&sig_bytes, &sig_size, sig);
+        printf("Exported signature length: %u bytes\n", sig_size);
+
+        // size_t sid_len;
+        // unsigned char *sid 
+        sid = concat2(k_S, PUB_LEN, sig_bytes, sig_size, &sid_len);
+        // print_hex("sid", sid, sid_len);
+        hash_sid_from_pub(sid, pkt.h.sid);
+        // print_hex("SID(S)=H(kC)", pkt.h.sid, SID_LEN);
+        // parse_frame_to_pkt(frame, frame_len, &pkt); // 既存関数
+        // Packet pkt;
+        if (parse_frame_to_pkt(frame, sizeof(frame), &pkt) != 0) { /* error */ }
+        if (memcmp(sid_chk, pkt.h.sid, SID_LEN) != 0) { /* mismatch */ }
+        printf("SID check: match\n");
+
+
+        // 4) groupsig 検証
+        // groupsig_signature_t *gsig = groupsig_signature_import(GROUPSIG_KTY04_CODE, groupsig_bytes, groupsig_len);
+        uint8_t val;
+        message_t *kSb = message_from_bytes(k_S, PUB_LEN);
+        groupsig_verify(&val, sig, kSb, grpkey);
+        printf("TGsig verification: %s\n", val ? "valid" : "invalid");
+
+        // 5) ペイロード復号
+        // ここでは pkt.p.iv, pkt.p.ct, pkt.p.tag を利用する
+        unsigned char plain_out[MAX_PTXT];
+        if (!aead_decrypt(nodes[NODES-1].sess_key, pkt.p.ct, pkt.p.ct_len, pkt.h.sid, pkt.p.iv, pkt.p.tag, plain_out)) {
+            /* decrypt fail */
+        }
+        if (memcmp(plain_out, plain, sizeof(plain)) != 0) { /* mismatch */ }
+        printf("Decrypt result match: %.*s\n", (int)pkt.p.ct_len, plain_out);
+
+        
+        // === Open（署名者を特定） ===
+        // crl, gml, mgrkeyの読み込み
+        crl_t *crl = crl_init(GROUPSIG_KTY04_CODE); // 失効リスト
+        groupsig_key_t *mgrkey = load_key_from_file("mgrkey.pem", GROUPSIG_KTY04_CODE, groupsig_mgr_key_import);
+
+        
+        // gml読み込み
+        std::ifstream fgml("gml.dat", std::ios::binary);
+        std::vector<unsigned char> buf((std::istreambuf_iterator<char>(fgml)), {});
+        gml_t *gml = gml_import(GROUPSIG_KTY04_CODE, buf.data(), buf.size());
+
+        uint64_t id = UINT64_MAX;
+        int rc = groupsig_open(&id, NULL, NULL, sig, grpkey, mgrkey, gml);
+        if (rc == IOK) {
+            printf("Open success: member ID = %lu\n", id);
+        } else {
+            printf("Open failed.\n");
+        }
+
+        // ******************各ルータに問い合わせてS特定
+
+        // === Reveal（特定メンバーを公開処理(CRLに入れる)） ===
+        trapdoor_t *trapdoor = trapdoor_init(GROUPSIG_KTY04_CODE);
+        rc = groupsig_reveal(trapdoor, crl, gml, id);
+        if (rc == IOK && trapdoor != NULL) {
+            printf("Reveal success: trapdoor valid, member ID = %lu added to CRL.\n", id);
+        } else {
+            printf("Reveal failed.\n");
+        }
+    
+        // trapdoorとCRLをRに送信
+
+        // Rの処理
+        // === Trace（署名が公開済み(CRL登録済)メンバーによるものか確認） ===
+        uint8_t traced = 0;
+        rc = groupsig_trace(&traced, sig, grpkey, crl, NULL, NULL);
+        if (rc == IOK) {
+            printf("Trace result: %d (1 = traced, 0 = not traced)\n", (int)traced);
+        } else {
+            printf("Trace failed.\n");
+        }
+    } else {
+        puts("Message allowed by policy.");
+    }
+    
     // 後処理
     for (int i=0;i<NODES;i++) {
         node_free(&nodes[i]);
