@@ -17,14 +17,40 @@
 #define PORT 9000
 #define SERVER_ADDR "127.0.0.1"
 
+// 鍵をファイルから読み込み
+groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme,
+                                   groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror("fopen");
+        return NULL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    rewind(f);
+
+    byte_t *buf = (byte_t *)malloc(len);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+
+    fread(buf, 1, len, f);
+    fclose(f);
+
+    groupsig_key_t *key = import_func(scheme, buf, len);
+    free(buf);
+    return key;
+}
+
+
 int main() {
     // === 初期化 ===
     groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));
 
     // --- グループ公開鍵を PEM から読み込み ---
-    std::ifstream fgrp("grpkey.pem", std::ios::binary);
-    std::vector<unsigned char> buf((std::istreambuf_iterator<char>(fgrp)), {});
-    groupsig_key_t *grpkey = groupsig_grp_key_import(GROUPSIG_KTY04_CODE, buf.data(), buf.size());
+    groupsig_key_t *grpkey = load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);
 
     // --- メンバー鍵作成 ---
     groupsig_key_t *memkey = groupsig_mem_key_init(GROUPSIG_KTY04_CODE);

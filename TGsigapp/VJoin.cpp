@@ -17,16 +17,40 @@
 
 #define PORT 9000
 
+// 鍵をファイルから読み込み
+groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme,
+                                   groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror("fopen");
+        return NULL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    rewind(f);
+
+    byte_t *buf = (byte_t *)malloc(len);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+
+    fread(buf, 1, len, f);
+    fclose(f);
+
+    groupsig_key_t *key = import_func(scheme, buf, len);
+    free(buf);
+    return key;
+}
+
+
 int main() {
     groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));
 
     // --- 既存の鍵読み込みまたは初期化 ---
-     std::ifstream fgrp("grpkey.pem", std::ios::binary);
-    std::vector<unsigned char> buf1((std::istreambuf_iterator<char>(fgrp)), {});
-    groupsig_key_t *grpkey = groupsig_grp_key_import(GROUPSIG_KTY04_CODE, buf1.data(), buf1.size());
-    std::ifstream fmgr("mgrkey.pem", std::ios::binary);
-    std::vector<unsigned char> buf2((std::istreambuf_iterator<char>(fmgr)), {});
-    groupsig_key_t *mgrkey = groupsig_mgr_key_import(GROUPSIG_KTY04_CODE, buf2.data(), buf2.size());
+    groupsig_key_t *grpkey = load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);
+    groupsig_key_t *mgrkey = load_key_from_file("mgrkey.pem", GROUPSIG_KTY04_CODE, groupsig_mgr_key_import);
     gml_t *gml = gml_init(GROUPSIG_KTY04_CODE);
 
     // --- ソケット待受 ---

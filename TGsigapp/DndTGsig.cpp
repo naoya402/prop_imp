@@ -826,15 +826,15 @@ int main(void) {
 
     // message_t *gsm = message_from_string((char *)kC_pub);
     message_t *gsm = message_from_bytes(kC_pub, PUB_LEN);
-    // print_hex("gsm", gsm->bytes, gsm->length);
     groupsig_signature_t *sig = groupsig_signature_init(GROUPSIG_KTY04_CODE);
     groupsig_sign(sig, gsm, memkey, grpkey, UINT_MAX);
-
+    
     // --- 署名をバイナリにエクスポート ---
     byte_t *sig_bytes = NULL;
     uint32_t sig_size = 0;
     groupsig_signature_export(&sig_bytes, &sig_size, sig);
-    printf("Exported signature length: %u bytes\n", sig_size);
+    // printf("Exported signature length: %u bytes\n", sig_size);
+    // print_hex("Group signature σ on kC", sig_bytes, sig_size);
     
    
     size_t sid_len;
@@ -925,11 +925,6 @@ int main(void) {
     }
 
     //　グループ署名の検証
-    // 検証側
-    unsigned char *decompressed = NULL;
-    // decompress_zlib(compressed, compressed_len, &decompressed, sig_size);
-    printf("Decompressed: %u / %u bytes\n", sig_size, sig_size);
-
     uint8_t valid;
     message_t *ppp = message_from_bytes(pkt.p.peer_pub, PUB_LEN);
     groupsig_verify(&valid, sig, ppp, grpkey);
@@ -1067,23 +1062,48 @@ int main(void) {
         // Rの処理
         // トラフィックを通報
         // 本来は保存したS_pubとsigを使う
+        // 以下の要素をすべて連結
         // S_pub,sig,pkt,plain,node[NODES-1].sess_key,pi_concat,state_get_prev(me,pkt.h.sid),sigma_s
+        size_t r1_len, r2_len, r3_len, r4_len, r5_len, r6_len;
+        unsigned char *r1=NULL, *r2=NULL, *r3=NULL, *r4=NULL, *r5=NULL, *r6=NULL;
 
+        unsigned char k_S[PUB_LEN];
+        memcpy(k_S, kC_pub, PUB_LEN);
+        unsigned char Sig[SIG_LEN];
+        memcpy(Sig, sig, sig_size);
 
+        r1 = concat2(k_S, PUB_LEN, Sig, sig_size, &r1_len);
+        r2 = concat2(r1, r1_len, (unsigned char *)&pkt, sizeof(Packet), &r2_len);
+        r3 = concat2(r2, r2_len, plain, (int)pkt.p.ct_len, &r3_len);
+        r4 = concat2(r3, r3_len, nodes[NODES-1].sess_key, KEY_LEN, &r4_len);
+        r5 = concat2(r4, r4_len, pkt.h.pi_concat, MAX_PI, &r5_len);
+        int prev_state = state_get_prev(me, pkt.h.sid);
+        r6 = concat2(r5, r5_len, (unsigned char *)&prev_state, sizeof(prev_state), &r6_len);
+        // print_hex("r6", r6, r6_len);
+
+        unsigned char sigma_s[SIG_LEN];
+        size_t sigma_s_len = SIG_LEN;
+
+        sign_data(nodes[NODES-1].sk, r6, r6_len, sigma_s, &sigma_s_len);
+        // print_hex("σ_s (signature by receiver)", sigma_s, sigma_s_len);
+        
         // 検証者Vの処理
         // 通報の正当性検証
-        unsigned char k_S[PUB_LEN];
-        memcpy(k_S, kC_pub, PUB_LEN); // Sの公開鍵
+        // unsigned char k_S[PUB_LEN];
+        // memcpy(k_S, kC_pub, PUB_LEN); // Sの公開鍵
+        // 0) 通報パケットのパース
+
         // 1) sigma 検証 (R_pub は known)
-        if (!ed25519_verify(R_pub, payload, payload_len, sigma, siglen)) {
-            fprintf(stderr, "Report signature invalid\n");
-            return -1;
+        // --- 署名検証 ---
+        if (verify_sig(nodes[NODES-1].pk, r6, r6_len, sigma_s, sigma_s_len)) {
+            printf("σ_s verification succeeded\n");
+        } else {
+            printf("σ_s verification failed\n");
         }
 
-        // 2) 通報パケットをパース
         
 
-        // 3) SID 再計算: 例 -> SID = SHA256( S_pub ) or whatever your scheme uses
+        // 2) SID 再計算: 例 -> SID = SHA256( S_pub ) or whatever your scheme uses
         unsigned char sid_chk[SID_LEN];
         // --- 署名をバイナリにエクスポート ---
         // byte_t *sig_bytes = NULL;
@@ -1104,14 +1124,14 @@ int main(void) {
         printf("SID check: match\n");
 
 
-        // 4) groupsig 検証
+        // 3) groupsig 検証
         // groupsig_signature_t *gsig = groupsig_signature_import(GROUPSIG_KTY04_CODE, groupsig_bytes, groupsig_len);
         uint8_t val;
         message_t *kSb = message_from_bytes(k_S, PUB_LEN);
         groupsig_verify(&val, sig, kSb, grpkey);
         printf("TGsig verification: %s\n", val ? "valid" : "invalid");
 
-        // 5) ペイロード復号
+        // 4) ペイロード復号
         // ここでは pkt.p.iv, pkt.p.ct, pkt.p.tag を利用する
         unsigned char plain_out[MAX_PTXT];
         if (!aead_decrypt(nodes[NODES-1].sess_key, pkt.p.ct, pkt.p.ct_len, pkt.h.sid, pkt.p.iv, pkt.p.tag, plain_out)) {

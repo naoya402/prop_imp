@@ -127,11 +127,11 @@ int main() {
     uint32_t sig_size = 0;
     groupsig_signature_export(&sig_bytes, &sig_size, sig);
 
-    printf("sig_bytes: %u\n", sig_size);
-    for (size_t i = 0; i < sig_size; i++) {
-        printf("%02x", sig_bytes[i]);
-    }
-    printf("\n");
+    printf("Sig_bytes: %u\n", sig_size);
+    // for (size_t i = 0; i < sig_size; i++) {
+    //     printf("%02x", sig_bytes[i]);
+    // }
+    // printf("\n");
 
     uint8_t valid;
     groupsig_verify(&valid, sig, msg, grpkey);
