@@ -10,6 +10,7 @@
 #include <ctime>
 
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/err.h>
@@ -42,6 +43,8 @@
 #define SIG_LEN 64
 #define GSIG_LEN 2040
 #define MAX_PI ((ROUTERS + 1) * SIG_LEN)
+#define ACSEG_LEN 32
+// #define MAX_ACSEG_CON ROUTERS * ACSEG_LEN
 #define MAX_PTXT 1024
 #define MAX_PKT  4096
 #define MAX_STATE  8
@@ -103,6 +106,9 @@ typedef struct {
     // SETUP_RESP ヘッダ: ρ
     unsigned char rho[2][SIG_LEN];             // ρ データ
 
+    // DATA_TRANS ヘッダ: アカウンタビリティセグメント
+    unsigned char acseg_concat[SIG_LEN];       // アカウンタビリティセグメント
+
 } Oheader;
 
 // ---- ペイロード ----
@@ -150,9 +156,9 @@ typedef struct {
     EVP_PKEY *pk;
 
     // セッション鍵
-    //センダーは全ノード分、レシーバは自ノード分のみ
+    //センダーは全ノード分(k)、レシーバは自ノード分のみ(ki)
     unsigned char k[NODES][KEY_LEN];//各ノードとの共有鍵
-    unsigned char ki[KEY_LEN];
+    unsigned char ki[KEY_LEN];//センダーと自ノードとの共有鍵
 
     unsigned char sess_key[KEY_LEN];
     int has_sess;
@@ -190,6 +196,7 @@ void print_hex(const char *title, const unsigned char *s, size_t len);
 void sha256(const unsigned char *data, size_t data_len, unsigned char hash[32]);
 void aead_encrypt(const unsigned char key[KEY_LEN],const unsigned char *pt, size_t pt_len, const unsigned char sid[SID_LEN], unsigned char iv[IV_LEN], unsigned char *ct, unsigned char tag[TAG_LEN]);
 int aead_decrypt(const unsigned char key[KEY_LEN], const unsigned char *ct, size_t ct_len, const unsigned char sid[SID_LEN], const unsigned char iv[IV_LEN], const unsigned char tag[TAG_LEN], unsigned char *pt_out);
+int hmac_sha256(const unsigned char *key, size_t keylen, const unsigned char *data, size_t datalen, unsigned char out[ACSEG_LEN], unsigned int *out_len);
 void sign_data(EVP_PKEY *sk, const unsigned char *data, size_t datalen, unsigned char *sig, size_t *siglen);
 int verify_sig(EVP_PKEY *pk, const unsigned char *data, size_t datalen, const unsigned char *sig, size_t siglen);
 // void prev_node_init(Node *node, int id, const char *addr);
@@ -213,6 +220,7 @@ size_t build_overlay_data_trans(unsigned char *l2, size_t cap, const Packet *pkt
 int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt);
 int router_handle_forward(unsigned char *frame, Node *nodes);
 int router_handle_reverse(unsigned char *frame, Node *nodes);
+int router_handle_data_trans(unsigned char *frame, Node *nodes);
 int apply_policy_contract(const char *msg);
 
 #endif
