@@ -207,8 +207,9 @@ void state_set(Node *n, const unsigned char sid[SID_LEN], unsigned char precid[C
 int state_get_next(const Node *n, const unsigned char sid[SID_LEN]);
 int state_get_prev(const Node *n, const unsigned char sid[SID_LEN]);
 const unsigned char* state_get_tau(const Node *n, const unsigned char sid[SID_LEN]);
+int save_pi_list(const unsigned char sid[SID_LEN], const unsigned char *pi_concat, size_t pi_len);
+int load_pi_list(const char *filename, unsigned char sid[SID_LEN], unsigned char **pi_out, size_t *pi_len_out);
 size_t overlay_header_footprint(void);//固定へッダ長
-
 // L2/L3 ダミーを埋めて最小 IPv4 ヘッダ(IHL = 5)作成
 size_t write_l2l3_min(unsigned char *buf, size_t buf_cap);
 size_t ipv4_header_len_bytes(const IPv4Hdr *ip);

@@ -288,6 +288,56 @@ const unsigned char* state_get_tau(const Node *n, const unsigned char sid[SID_LE
     return NULL;
 }
 
+// π-list をセッションID (SID) ごとに保存
+int save_pi_list(const unsigned char sid[SID_LEN], const unsigned char *pi_concat, size_t pi_len) {
+    // char filename[128];
+    // // SIDの先頭8バイトをファイル名に利用
+    // char sid_hex[17];
+    // for (int i = 0; i < 8; i++)
+    //     sprintf(&sid_hex[i*2], "%02x", sid[i]);
+    // sid_hex[16] = '\0';
+    // snprintf(filename, sizeof(filename), "pi_%s.dat", sid_hex);
+    const char *filename = "pi_list.dat";
+
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        perror("fopen");
+        return -1;
+    }
+
+    // ファイル構造: [SID(32B)] [π-list本体]
+    fwrite(sid, 1, SID_LEN, f);
+    fwrite(pi_concat, 1, pi_len, f);
+    fclose(f);
+    
+    printf("Saved π-list (%zu bytes) as %s\n", pi_len, filename);
+    return 0;
+}
+
+int load_pi_list(const char *filename, unsigned char sid[SID_LEN], unsigned char **pi_out, size_t *pi_len_out){
+    FILE *f = fopen(filename, "rb");
+    if (!f) {
+        perror("fopen");
+        return -1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    rewind(f);
+
+    if (len <= SID_LEN) {
+        fclose(f);
+        return -1;
+    }
+
+    fread(sid, 1, SID_LEN, f);
+    *pi_len_out = len - SID_LEN;
+    *pi_out[*pi_len_out];
+    fread(*pi_out, 1, *pi_len_out, f);
+    fclose(f);
+
+    return 0;
+}
 
 //========= オーバーレイ領域ヘッダ & ペイロード=========
 size_t overlay_header_footprint(void) { return SID_LEN + CID_LEN + 1 + 1 + 4; }//固定へッダ長
@@ -380,7 +430,7 @@ size_t build_overlay_setup_resp(unsigned char *l2, size_t cap, const Packet *pkt
 size_t build_overlay_data_trans(unsigned char *l2, size_t cap, const Packet *pkt) {
     size_t off = l3_overlay_offset(l2);
     uint16_t ctlen = (uint16_t)pkt->p.ct_len;
-    size_t need = off + overlay_header_footprint() +  pkt->h.idx * ACSEG_LEN + IV_LEN + 2 + ctlen + TAG_LEN;
+    size_t need = off + overlay_header_footprint() +  (pkt->h.idx - 1) * ACSEG_LEN + IV_LEN + 2 + ctlen + TAG_LEN;
     if (cap < need) die("cap too small (data trans)");
     unsigned char *p = l2 + off;
     // ヘッダ
@@ -388,7 +438,7 @@ size_t build_overlay_data_trans(unsigned char *l2, size_t cap, const Packet *pkt
     memcpy(p, &pkt->h.cid, 1); p += CID_LEN;
     *p++ = pkt->h.status;
     *p++ = pkt->h.idx;
-    memcpy(p, pkt->h.acseg_concat, pkt->h.idx * ACSEG_LEN); p += pkt->h.idx * ACSEG_LEN;
+    memcpy(p, pkt->h.acseg_concat, (pkt->h.idx - 1) * ACSEG_LEN); p += (pkt->h.idx - 1) * ACSEG_LEN;
     // ぺイロード
     memcpy(p, pkt->p.iv, IV_LEN); p += IV_LEN;
     uint16_t n = htons(ctlen); memcpy(p, &n, 2); p += 2;
@@ -399,7 +449,6 @@ size_t build_overlay_data_trans(unsigned char *l2, size_t cap, const Packet *pkt
 
 // フレームからパケットをパース
 int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt) {
-
     // L2/L3を読み飛ばす
     size_t l3end = 34;//read_l2l3_min(frame, frame_len);
     if (l3end == 0) return -1;
@@ -410,7 +459,6 @@ int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt
     
     //固定ヘッダ
     memcpy(pkt->h.sid, p, SID_LEN); p += SID_LEN;
-    // print_hex("pkt.h.sid", pkt->h.sid, SID_LEN);
     memcpy(pkt->h.cid, p, CID_LEN); p += CID_LEN;
     pkt->h.status = *p++;
     pkt->h.idx = *p++;
@@ -459,8 +507,8 @@ int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt
         if (p + PUB_LEN > buf + len) return -1;
         memcpy(pkt->p.peer_pub, p, PUB_LEN); p += PUB_LEN;
     } else if (pkt->h.status == DATA_TRANS) {
-        if (p + pkt->h.idx * ACSEG_LEN > buf + len) return -1;
-        memcpy(pkt->h.acseg_concat, p, pkt->h.idx * ACSEG_LEN); p += pkt->h.idx * ACSEG_LEN;
+        if (p + (pkt->h.idx - 1) * ACSEG_LEN > buf + len) return -1;
+        memcpy(pkt->h.acseg_concat, p, (pkt->h.idx - 1) * ACSEG_LEN); p += (pkt->h.idx - 1) * ACSEG_LEN;
         // payload: IV + CT_LEN + CT + TAG
         if (p + IV_LEN > buf + len) return -1;
         memcpy(pkt->p.iv, p, IV_LEN); p += IV_LEN;
@@ -726,37 +774,36 @@ int router_handle_data_trans(unsigned char *frame, Node *nodes) {
     //アカウンタビリティセグメントを付加
     // ペイロード部の連結
     size_t pay_len = IV_LEN + 2 + pkt.p.ct_len + TAG_LEN;
-    unsigned char pay_buf[pay_len];
-    // if (!pay_buf) { fprintf(stderr,"malloc failed (pay_buf)\n"); return -1; }
-    unsigned char *pp = pay_buf;
-    memcpy(pp, pkt.p.iv, IV_LEN); pp += IV_LEN;
+    unsigned char *pay_buf1; size_t pay_buf1_len;
+    unsigned char *pay_buf2; size_t pay_buf2_len;
+    unsigned char *pay_buf3; size_t pay_buf3_len;
     uint16_t ctlen_n = htons((uint16_t)pkt.p.ct_len);
-    memcpy(pp, &ctlen_n, 2); pp += 2;
-    if (pkt.p.ct_len > 0) {
-        memcpy(pp, pkt.p.ct, pkt.p.ct_len); pp += pkt.p.ct_len;
-    }
-    memcpy(pp, pkt.p.tag, TAG_LEN); pp += TAG_LEN;
-    // print_hex("Payload for ACSEG: ",pay_buf, pay_len);
+    pay_buf1 = concat2(pkt.p.iv, IV_LEN, (unsigned char*)&ctlen_n, 2, &pay_buf1_len);
+    pay_buf2 = concat2(pay_buf1, pay_buf1_len, pkt.p.ct, pkt.p.ct_len, &pay_buf2_len);
+    pay_buf3 = concat2(pay_buf2, pay_buf2_len, pkt.p.tag, TAG_LEN, &pay_buf3_len);
+    // print_hex("Payload for ACSEG: ",pay_buf3, pay_buf3_len);
 
     // SID || Payload || next_addr(4B)
-    size_t ac_plain_len = SID_LEN + pay_len + 4;
+    size_t ac_plain_len = SID_LEN + pay_buf3_len + 4;
     unsigned char *ac_plain1; size_t ac_plain1_len;
     unsigned char *ac_plain2; size_t ac_plain2_len;
 
     uint32_t next_addr_n = htonl((uint32_t)next_addr);
-    ac_plain1 = concat2(pkt.h.sid, SID_LEN, pay_buf, pay_len, &ac_plain1_len);
+    ac_plain1 = concat2(pkt.h.sid, SID_LEN, pay_buf3, pay_buf3_len, &ac_plain1_len);
     ac_plain2 = concat2(ac_plain1, ac_plain1_len, (unsigned char*)&next_addr_n, 4, &ac_plain2_len);
     // print_hex("AC_PLAIN: ", ac_plain2, ac_plain2_len);
 
     // HMACでACSEG生成
     unsigned char acseg[ACSEG_LEN];
     unsigned int acseg_len;
+    // print_hex("me->ki", me->ki, KEY_LEN);
     int hmac_result = hmac_sha256(me->ki, KEY_LEN, ac_plain2, ac_plain2_len, acseg, &acseg_len);
     if (hmac_result != 0) {
         fprintf(stderr,"HMAC failed at R%d\n", idx);
         return -1;
     }
-    // printf("R%d ACSEG: ", idx); print_hex("", acseg, acseg_len);
+    // printf("R%d ACSEG: ", idx); 
+    // print_hex("", acseg, acseg_len);
 
     size_t offset = (idx - 1) * ACSEG_LEN;
 
@@ -766,11 +813,12 @@ int router_handle_data_trans(unsigned char *frame, Node *nodes) {
         return -1;
     }
     memcpy(pkt.h.acseg_concat + offset, acseg, acseg_len);
+    // print_hex("ACSEG", pkt.h.acseg_concat, (pkt.h.idx - 1) * ACSEG_LEN);
 
     pkt.h.idx++;
     
     size_t wire_len = build_overlay_data_trans(frame, frame_cap, &pkt);
-    printf("Data Trans frame wire_len=%zu \n", wire_len);
+    // printf("Data Trans frame wire_len=%zu \n", wire_len);
     return 0;
 }
 

@@ -56,7 +56,7 @@ int main(void) {
     int idx = 0;
     Node *me = &nodes[idx];
     get_raw_pub(me->dh_sk, kC_pub);
-    print_hex("kC_pub", kC_pub, PUB_LEN);
+    // print_hex("kC_pub", kC_pub, PUB_LEN);
 
     // --- グループ署名生成 ---
     groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));

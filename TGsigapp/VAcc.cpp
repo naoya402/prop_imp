@@ -4,6 +4,9 @@
 #include "groupsig/kty04.h"
 #include "groupsig/message.h"
 
+#include <time.h>
+#include <unistd.h>
+
 #include "func.h"
 
 // 鍵をファイルから読み込み
@@ -45,12 +48,6 @@ int main(void) {
     }
 
     Packet pkt;
-
-    // unsigned char k_S[PUB_LEN];
-    // get_raw_pub(nodes[0].dh_sk, k_S);
-    // // memcpy(k_S, kC_pub, PUB_LEN);
-    // unsigned char Sig[SIG_LEN];
-    // memcpy(Sig, sig, sig_size);
 
     // 検証者Vの処理
 
@@ -122,7 +119,7 @@ int main(void) {
     memcpy(sess_key, r9 + offset, KEY_LEN); offset += KEY_LEN;
     // print_hex("sess_key", sess_key, KEY_LEN);
 
-    // 6) π_con cat
+    // 6) π_concat
     unsigned char pi_concat[MAX_PI];
     memcpy(pi_concat, r9 + offset, MAX_PI); offset += MAX_PI;
     // print_hex("pi_concat", pi_concat, MAX_PI);
@@ -149,7 +146,7 @@ int main(void) {
     // print_hex("r (data signed by Receiver)", r, r_len);
     // --- 署名検証 ---
     if (verify_sig(nodes[NODES-1].pk, r, r_len, sigma_r, SIG_LEN)) {
-        printf("σ_R verification succeeded\n");
+        // printf("σ_R verification succeeded\n");
     } else {
         printf("σ_R verification failed\n");
     }
@@ -173,7 +170,7 @@ int main(void) {
     // unsigned char frame[MAX_FRAME];
     // if (parse_frame_to_pkt(frame, sizeof(frame), &pkt) != 0) { /* error */ }
     if (memcmp(sid_chk, pkt.h.sid, SID_LEN) != 0) { /* mismatch */ }
-    printf("SID check: match\n");
+    // printf("SID check: match\n");
 
 
     // 3) groupsig 検証
@@ -181,7 +178,7 @@ int main(void) {
     uint8_t val;
     message_t *kSb = message_from_bytes(k_S, PUB_LEN);
     groupsig_verify(&val, sig, kSb, grpkey);
-    printf("TGsig verification: %s\n", val ? "valid" : "invalid");
+    // printf("TGsig verification: %s\n", val ? "valid" : "invalid");
 
     // 4) ペイロード復号
     // ここでは pkt.p.iv, pkt.p.ct, pkt.p.tag を利用する
@@ -192,17 +189,30 @@ int main(void) {
     // printf("plain_out: %.*s\n", (int)pkt.p.ct_len, plain_out);
     if (memcmp(plain_out, plain_recv, sizeof(plain_recv)) != 0) { /* mismatch */ }
     // printf("Decrypt result match: %.*s\n", (int)pkt.p.ct_len, plain_out);
+    
+    // 5) コントラクト検証
+    int blocked = apply_policy_contract((const char *)plain_recv);
+    if (!blocked) {// 以降の処理は行わない
+    } 
+    // printf("Policy contract violation.\n");
 
     // === Open（署名者を特定） ===
     // crl, gml, mgrkeyの読み込み
     crl_t *crl = crl_init(GROUPSIG_KTY04_CODE); // 失効リスト
     groupsig_key_t *mgrkey = load_key_from_file("mgrkey.pem", GROUPSIG_KTY04_CODE, groupsig_mgr_key_import);
 
-    
     // gml読み込み
-    std::ifstream fgml("gml.dat", std::ios::binary);
-    std::vector<unsigned char> buf((std::istreambuf_iterator<char>(fgml)), {});
-    gml_t *gml = gml_import(GROUPSIG_KTY04_CODE, buf.data(), buf.size());
+    FILE *fgml = fopen("gml.dat", "rb");
+    if (!fgml) die("fopen gml.dat");
+    fseek(fgml, 0, SEEK_END);
+    size_t gml_len = ftell(fgml);
+    fseek(fgml, 0, SEEK_SET);
+    unsigned char *gml_buf = (unsigned char *)malloc(gml_len);
+    if (!gml_buf) die("malloc gml_buf");
+    fread(gml_buf, 1, gml_len, fgml);
+    fclose(fgml);
+    gml_t *gml = gml_import(GROUPSIG_KTY04_CODE, gml_buf, gml_len);
+    free(gml_buf);
 
     uint64_t id = UINT64_MAX;
     int rc = groupsig_open(&id, NULL, NULL, sig, grpkey, mgrkey, gml);
@@ -211,11 +221,148 @@ int main(void) {
     } else {
         printf("Open failed.\n");
     }
-
-    // ******************各ルータに問い合わせてS特定
-    // ルータから得たidリストと比較してSを特定
     
+    // ルータから得たidリストと比較してSを特定
+    const char *signer = router_addresses[id]; // 仮にidをインデックスとしてSを特定
+    // gml_entry_t *entry = gml_get(gml, id);
+    // if (!entry) {
+    //     fprintf(stderr, "No entry found for ID %lu\n", id);
+    // }
+    // char *entry_str = gml_entry_to_string(entry);
+    // printf("=== GML Entry ID %lu ===\n%s\n", id, entry_str);
+    // free(entry_str);
 
+    // 各ノードに問い合わせてS特定
+    // idがそのままSのIDとする
+    uint64_t s_id = id;
+
+    // 送信パケットの構築
+    // ペイロード部の連結
+    size_t pay_len = IV_LEN + 2 + pkt.p.ct_len + TAG_LEN;
+    unsigned char *pay_buf1; size_t pay_buf1_len;
+    unsigned char *pay_buf2; size_t pay_buf2_len;
+    unsigned char *pay_buf3; size_t pay_buf3_len;
+    uint16_t ctlen_n = htons((uint16_t)pkt.p.ct_len);
+    pay_buf1 = concat2(pkt.p.iv, IV_LEN, (unsigned char*)&ctlen_n, 2, &pay_buf1_len);
+    pay_buf2 = concat2(pay_buf1, pay_buf1_len, pkt.p.ct, pkt.p.ct_len, &pay_buf2_len);
+    pay_buf3 = concat2(pay_buf2, pay_buf2_len, pkt.p.tag, TAG_LEN, &pay_buf3_len);
+    // SID(32B) || Payload(41B) || next_addr(4B)|| ACSEG((ROUTERS)*32B)
+    unsigned char *ac_plain1; size_t ac_plain1_len;
+    unsigned char *ac_plain2; size_t ac_plain2_len;
+    unsigned char *ac_plain3; size_t ac_plain3_len;
+
+    uint32_t next_addr_n = htonl((uint32_t)pkt.h.idx);//次のルータアドレスを現在のインデックスに指定 本来はstateから取得
+    ac_plain1 = concat2(pkt.h.sid, SID_LEN, pay_buf3, pay_len, &ac_plain1_len);
+    // print_hex("AC_SEG: ", pkt.h.acseg_concat, (pkt.h.idx - 1) * ACSEG_LEN);
+    // print_hex("AC_PLAIN: ", ac_plain3, ac_plain3_len);
+    
+    // // Sになるまで問い合わせループ
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    uint32_t cur_id = prev_state; // 最後に接続したルータのIDから開始
+    int flags = 0;
+    while (1) {
+        // ルータに問い合わせてSを特定
+        ac_plain2 = concat2(ac_plain1, ac_plain1_len, (unsigned char*)&next_addr_n, 4, &ac_plain2_len);
+        ac_plain3 = concat2(ac_plain2, ac_plain2_len, pkt.h.acseg_concat, (pkt.h.idx - 1) * ACSEG_LEN, &ac_plain3_len);
+        // === ソケット送信 ===
+        sockaddr_in serv_addr{};
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(9010);
+        inet_pton(AF_INET, SERVER_ADDR, &serv_addr.sin_addr);
+
+        if (connect(sock, (sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            perror("connect");
+            return 1;
+        }
+
+        uint32_t resp_len_n = htonl(ac_plain3_len);
+        send(sock, &resp_len_n, sizeof(resp_len_n), 0);
+        send(sock, ac_plain3, ac_plain3_len, 0);
+        printf("[Verifier] Sent AC_PLAIN to Router R%d\n", cur_id);
+
+
+        //問い合わせの応答受信
+        uint32_t reinq_len_n;
+        recv(sock, &reinq_len_n, sizeof(reinq_len_n), 0);
+        uint32_t reinq_len = ntohl(reinq_len_n);
+
+        unsigned char reinq[reinq_len];
+        recv(sock, reinq, reinq_len, MSG_WAITALL);
+        printf("[Verifier] Received reinq (%u bytes) from Router R%d\n", reinq_len, cur_id);
+        // print_hex("reinq", reinq, reinq_len);
+
+        // ノードからの応答パケットのパース
+        size_t offset = 0;
+        int tmp_addr = 0; // 本来前ホップアドレス(今回はID)
+        int flag = 0; // 各ノードのアカセグ検証結果フラグ
+        unsigned char rand_val[4];
+        unsigned char tau[SIG_LEN];
+        memcpy(&tmp_addr, reinq + offset, sizeof(tmp_addr)); offset += sizeof(tmp_addr);
+        // printf("[Verifier] Received next Router ID: %d\n", tmp_addr);
+        memcpy(tau, reinq + offset, SIG_LEN); offset += SIG_LEN;
+        // print_hex("[Verifier] Received tau: ", tau, SIG_LEN);
+        memcpy(rand_val, reinq + offset, sizeof(rand_val)); offset += sizeof(rand_val);
+        // print_hex("[Verifier] Received rand_val: ", rand_val, sizeof(rand_val));
+        memcpy(&flag, reinq + offset, sizeof(int)); offset += sizeof(int);
+        printf("[Verifier] Received flags: %d\n", flag);
+
+        if (s_id != tmp_addr) {
+            // π検証  通報のpi_concatからπiを抽出して検証
+            // print_hex("pi_concat", pi_concat, MAX_PI);
+            size_t offset = (tmp_addr) * SIG_LEN;
+            if (offset + SIG_LEN > MAX_PI) { 
+                fprintf(stderr,"pi_concat out of range\n"); 
+                return -1; 
+            }
+            unsigned char *pi_vrf = pi_concat + offset;
+            // print_hex("pi_vrf", pi_vrf, SIG_LEN);
+            size_t n_len;
+            unsigned char *n = concat2(tau, SIG_LEN, rand_val, sizeof(rand_val), &n_len);
+            if (!verify_sig(nodes[tmp_addr].pk, n, n_len, pi_vrf, SIG_LEN)) {
+                free(n); 
+                fprintf(stderr,"Verify π%d failed\n", tmp_addr + 1); 
+                return -1;
+            }
+            free(n);
+            printf("Verify π%d success \n", tmp_addr);
+            // τi-1検証
+            unsigned char *m = NULL; size_t m_len = 0;
+            m = concat2(pkt.h.sid, SID_LEN, nodes[tmp_addr].addr, sizeof(nodes[tmp_addr].addr), &m_len);
+            if (!verify_sig(nodes[tmp_addr].pk, m, m_len, tau, SIG_LEN)) {//pkt.p.tau_len)) {
+                fprintf(stderr, "Verify τ%d failed\n", tmp_addr);
+                free(m);
+                return -1;
+            }
+            printf("Verify τ%d success\n", tmp_addr);
+            free(m);
+            
+            // 次のルータへの問い合わせ準備
+            next_addr_n = htonl((uint32_t)cur_id);
+            cur_id = ntohl(tmp_addr);
+            printf("[Verifier] Continuing to next Router...\n");
+        } else {
+            // τi-1検証
+            unsigned char *m = NULL; size_t m_len = 0;
+            m = concat2(pkt.h.sid, SID_LEN, nodes[tmp_addr].addr, sizeof(nodes[tmp_addr].addr), &m_len);
+            if (!verify_sig(nodes[tmp_addr].pk, m, m_len, tau, SIG_LEN)) {//pkt.p.tau_len)) {
+                fprintf(stderr, "Verify τ%d failed\n", tmp_addr);
+                free(m);
+                return -1;
+            }
+            printf("Verify τ%d success\n", tmp_addr);
+            printf("[Verifier] Router R%d is identified as the Sender S!\n", tmp_addr);
+            break;
+        }
+        flags += flag;
+        
+        // sleep(3); // 少し待つ
+    }
+    close(sock);
+
+    // flagsからセッションとペイロードのリンクの合意をとる
+    // すべてオネストな検証をしていれば経由した1~nのノードになっているはず
+    // 攻撃者が1人ならn-1、攻撃者が2人ならn-2、...となるはず
+    printf("Flags value: %d\n", flags);
     // === Reveal（特定メンバーを公開処理(CRLに入れる)） ===
     trapdoor_t *trapdoor = trapdoor_init(GROUPSIG_KTY04_CODE);
     rc = groupsig_reveal(trapdoor, crl, gml, id);
@@ -225,7 +372,7 @@ int main(void) {
         printf("Reveal failed.\n");
     }
 
-    // trapdoorとCRLをRに送信
+    // CRLをRに送信?(共有している想定なら不要)
 
     // Rの処理
     // === Trace（署名が公開済み(CRL登録済)メンバーによるものか確認） ===

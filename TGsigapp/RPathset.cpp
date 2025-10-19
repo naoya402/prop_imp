@@ -260,6 +260,9 @@ int main() {
     me->has_sess = 1;
     print_hex("R derived k", me->sess_key, KEY_LEN);
 
+    // πリスト保存
+    save_pi_list(pkt.h.sid, pkt.h.pi_concat, MAX_PI);
+
     printf("\n===============================復路=================================");
     // レシーバRの処理
     printf("\n=== Node R(R%d) ===\n", NODES - 1);
@@ -345,15 +348,16 @@ int main() {
     memcpy(pkt.h.sid, sid_use, SID_LEN);
 
     pkt.h.status = DATA_TRANS;
-    pkt.h.idx = 1;//　本来必要ないが1にしておく
-
+    
     aead_encrypt(nodes[0].sess_key, (const unsigned char*)msg, msg_len, pkt.h.sid, pkt.p.iv, pkt.p.ct, pkt.p.tag);
     pkt.p.ct_len = msg_len;
-
+    
+    pkt.h.idx = 1;//　本来必要ないが1にしておく
     // ==== DATA_TRANS をパケットに積む ====
     memset(frame, 0, sizeof(frame));
     write_l2l3_min(frame, sizeof(frame));
     wire_len = build_overlay_data_trans(frame, sizeof(frame), &pkt);
+    printf("Data Trans frame wire_len=%zu \n", wire_len);
 
     // 各ノードの処理: state.next で転送
     int cur = nodes[1].id;
