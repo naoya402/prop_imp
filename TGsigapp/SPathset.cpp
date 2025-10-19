@@ -50,6 +50,7 @@ int main(void) {
     printf("\n===============================往路=================================\n");
     printf("=== Node S(R0) ===\n");
 
+
     Packet pkt;
     // k_C 公開鍵取り出し & SID=H(k_C)
     unsigned char kC_pub[PUB_LEN];
@@ -66,6 +67,9 @@ int main(void) {
     message_t *gsm = message_from_bytes(kC_pub, PUB_LEN);
     groupsig_signature_t *sig = groupsig_signature_init(GROUPSIG_KTY04_CODE);
     groupsig_sign(sig, gsm, memkey, grpkey, UINT_MAX);
+    // char *strsig = groupsig_signature_to_string(sig);
+    // printf("sig: %s\n", strsig);
+    // free(strsig);
 
     // // --- 署名をバイナリに変換 ---
     byte_t *sig_bytes = NULL;
