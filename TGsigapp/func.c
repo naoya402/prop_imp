@@ -818,7 +818,7 @@ int router_handle_data_trans(unsigned char *frame, Node *nodes) {
     pkt.h.idx++;
     
     size_t wire_len = build_overlay_data_trans(frame, frame_cap, &pkt);
-    // printf("Data Trans frame wire_len=%zu \n", wire_len);
+    printf("Data Trans frame wire_len=%zu \n", wire_len);
     return 0;
 }
 

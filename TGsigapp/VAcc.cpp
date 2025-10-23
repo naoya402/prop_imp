@@ -139,16 +139,16 @@ int main(void) {
 
     // 通報の正当性検証
     // 1) sigma 検証 (R_pub は known)
-    // --- 署名対象データ (σ_s を除く部分) ---
-    size_t r_len = len - SIG_LEN;  // r9 全体から σ_s を除いた長さ
+    // --- 署名対象データ (σ_r を除く部分) ---
+    size_t r_len = len - SIG_LEN;  // r9 全体から σ_r を除いた長さ
     unsigned char *r = (unsigned char *)malloc(r_len);
     memcpy(r, r9, r_len);
     // print_hex("r (data signed by Receiver)", r, r_len);
     // --- 署名検証 ---
     if (verify_sig(nodes[NODES-1].pk, r, r_len, sigma_r, SIG_LEN)) {
-        // printf("σ_R verification succeeded\n");
+        printf("σ_r verification succeeded\n");
     } else {
-        printf("σ_R verification failed\n");
+        printf("σ_r verification failed\n");
     }
 
     // 2) SID 再計算: 例 -> SID = SHA256( S_pub ) or whatever your scheme uses
@@ -170,7 +170,7 @@ int main(void) {
     // unsigned char frame[MAX_FRAME];
     // if (parse_frame_to_pkt(frame, sizeof(frame), &pkt) != 0) { /* error */ }
     if (memcmp(sid_chk, pkt.h.sid, SID_LEN) != 0) { /* mismatch */ }
-    // printf("SID check: match\n");
+    printf("SID check: match\n");
 
 
     // 3) groupsig 検証
@@ -178,7 +178,7 @@ int main(void) {
     uint8_t val;
     message_t *kSb = message_from_bytes(k_S, PUB_LEN);
     groupsig_verify(&val, sig, kSb, grpkey);
-    // printf("TGsig verification: %s\n", val ? "valid" : "invalid");
+    printf("TGsig verification: %s\n", val ? "valid" : "invalid");
 
     // 4) ペイロード復号
     // ここでは pkt.p.iv, pkt.p.ct, pkt.p.tag を利用する
@@ -188,13 +188,13 @@ int main(void) {
     }
     // printf("plain_out: %.*s\n", (int)pkt.p.ct_len, plain_out);
     if (memcmp(plain_out, plain_recv, sizeof(plain_recv)) != 0) { /* mismatch */ }
-    // printf("Decrypt result match: %.*s\n", (int)pkt.p.ct_len, plain_out);
+    printf("Decrypt result match: %.*s\n", (int)pkt.p.ct_len, plain_out);
     
     // 5) コントラクト検証
     int blocked = apply_policy_contract((const char *)plain_recv);
     if (!blocked) {// 以降の処理は行わない
     } 
-    // printf("Policy contract violation.\n");
+    printf("Policy contract False.\n");
 
     // === Open（署名者を特定） ===
     // crl, gml, mgrkeyの読み込み
@@ -278,7 +278,7 @@ int main(void) {
         uint32_t resp_len_n = htonl(ac_plain3_len);
         send(sock, &resp_len_n, sizeof(resp_len_n), 0);
         send(sock, ac_plain3, ac_plain3_len, 0);
-        printf("[Verifier] Sent AC_PLAIN to Router R%d\n", cur_id);
+        printf("[Verifier] Sent INQ to R%d\n", 1);//cur_id);
 
 
         //問い合わせの応答受信
@@ -288,7 +288,7 @@ int main(void) {
 
         unsigned char reinq[reinq_len];
         recv(sock, reinq, reinq_len, MSG_WAITALL);
-        printf("[Verifier] Received reinq (%u bytes) from Router R%d\n", reinq_len, cur_id);
+        printf("[Verifier] Received REINQ (%u bytes) from R%d\n", reinq_len, 1);//cur_id);
         // print_hex("reinq", reinq, reinq_len);
 
         // ノードからの応答パケットのパース
@@ -303,57 +303,58 @@ int main(void) {
         // print_hex("[Verifier] Received tau: ", tau, SIG_LEN);
         memcpy(rand_val, reinq + offset, sizeof(rand_val)); offset += sizeof(rand_val);
         // print_hex("[Verifier] Received rand_val: ", rand_val, sizeof(rand_val));
-        memcpy(&flag, reinq + offset, sizeof(int)); offset += sizeof(int);
-        printf("[Verifier] Received flags: %d\n", flag);
+        memcpy(&flag, reinq + offset, 2); offset += 2;
+        // printf("Received flag: %d\n", flag);
+
+        // π検証  通報のpi_concatからπiを抽出して検証
+        // print_hex("pi_concat", pi_concat, MAX_PI);
+        size_t pioffset = (tmp_addr) * SIG_LEN;
+        if (pioffset + SIG_LEN > MAX_PI) {
+            fprintf(stderr,"pi_concat out of range\n");
+            return -1;
+        }
+        unsigned char *pi_vrf = pi_concat + pioffset;
+        // print_hex("pi_vrf", pi_vrf, SIG_LEN);
+        size_t n_len;
+        unsigned char *n = concat2(tau, SIG_LEN, rand_val, sizeof(rand_val), &n_len);
+        if (!verify_sig(nodes[tmp_addr].pk, n, n_len, pi_vrf, SIG_LEN)) {
+            free(n); 
+            fprintf(stderr,"Verify π%d failed\n", tmp_addr + 1); 
+            return -1;
+        }
+        free(n);
+        printf("Verify π%d success \n", tmp_addr + 1);
+        // τi-1検証
+        unsigned char *m = NULL; size_t m_len = 0;
+        m = concat2(pkt.h.sid, SID_LEN, nodes[tmp_addr].addr, sizeof(nodes[tmp_addr].addr), &m_len);
+        if (!verify_sig(nodes[tmp_addr].pk, m, m_len, tau, SIG_LEN)) {//pkt.p.tau_len)) {
+            fprintf(stderr, "Verify τ%d failed\n", tmp_addr);
+            free(m);
+            return -1;
+        }
+        free(m);
+        printf("Verify τ%d success\n", tmp_addr);
 
         if (s_id != tmp_addr) {
-            // π検証  通報のpi_concatからπiを抽出して検証
-            // print_hex("pi_concat", pi_concat, MAX_PI);
-            size_t offset = (tmp_addr) * SIG_LEN;
-            if (offset + SIG_LEN > MAX_PI) { 
-                fprintf(stderr,"pi_concat out of range\n"); 
-                return -1; 
-            }
-            unsigned char *pi_vrf = pi_concat + offset;
-            // print_hex("pi_vrf", pi_vrf, SIG_LEN);
-            size_t n_len;
-            unsigned char *n = concat2(tau, SIG_LEN, rand_val, sizeof(rand_val), &n_len);
-            if (!verify_sig(nodes[tmp_addr].pk, n, n_len, pi_vrf, SIG_LEN)) {
-                free(n); 
-                fprintf(stderr,"Verify π%d failed\n", tmp_addr + 1); 
-                return -1;
-            }
-            free(n);
-            printf("Verify π%d success \n", tmp_addr);
-            // τi-1検証
-            unsigned char *m = NULL; size_t m_len = 0;
-            m = concat2(pkt.h.sid, SID_LEN, nodes[tmp_addr].addr, sizeof(nodes[tmp_addr].addr), &m_len);
-            if (!verify_sig(nodes[tmp_addr].pk, m, m_len, tau, SIG_LEN)) {//pkt.p.tau_len)) {
-                fprintf(stderr, "Verify τ%d failed\n", tmp_addr);
-                free(m);
-                return -1;
-            }
-            printf("Verify τ%d success\n", tmp_addr);
-            free(m);
-            
             // 次のルータへの問い合わせ準備
             next_addr_n = htonl((uint32_t)cur_id);
             cur_id = ntohl(tmp_addr);
             printf("[Verifier] Continuing to next Router...\n");
+            flags += flag;
         } else {
-            // τi-1検証
-            unsigned char *m = NULL; size_t m_len = 0;
-            m = concat2(pkt.h.sid, SID_LEN, nodes[tmp_addr].addr, sizeof(nodes[tmp_addr].addr), &m_len);
-            if (!verify_sig(nodes[tmp_addr].pk, m, m_len, tau, SIG_LEN)) {//pkt.p.tau_len)) {
-                fprintf(stderr, "Verify τ%d failed\n", tmp_addr);
-                free(m);
-                return -1;
-            }
-            printf("Verify τ%d success\n", tmp_addr);
-            printf("[Verifier] Router R%d is identified as the Sender S!\n", tmp_addr);
+            // // τi-1検証
+            // unsigned char *m = NULL; size_t m_len = 0;
+            // m = concat2(pkt.h.sid, SID_LEN, nodes[tmp_addr].addr, sizeof(nodes[tmp_addr].addr), &m_len);
+            // if (!verify_sig(nodes[tmp_addr].pk, m, m_len, tau, SIG_LEN)) {//pkt.p.tau_len)) {
+            //     fprintf(stderr, "Verify τ%d failed\n", tmp_addr);
+            //     free(m);
+            //     return -1;
+            // }
+            // printf("Verify τ%d success\n", tmp_addr);
+            printf("Router R%d is identified as the Sender\n", tmp_addr);
+            flags += flag;
             break;
         }
-        flags += flag;
         
         // sleep(3); // 少し待つ
     }

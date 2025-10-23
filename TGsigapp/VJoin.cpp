@@ -18,8 +18,7 @@
 #define PORT 9000
 
 // 鍵をファイルから読み込み
-groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme,
-                                   groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
+groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         perror("fopen");
@@ -58,11 +57,11 @@ int main() {
     sockaddr_in serv_addr{};
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons(PORT);
+    serv_addr.sin_port = htons(9300);
     bind(serv_sock, (sockaddr *)&serv_addr, sizeof(serv_addr));
     listen(serv_sock, 1);
 
-    std::cout << "[Verifier] Waiting for join request...\n";
+    printf("[Verifier] Waiting for join request...\n");
 
     int client_sock = accept(serv_sock, nullptr, nullptr);
 
@@ -71,9 +70,10 @@ int main() {
     recv(client_sock, &len_n, sizeof(len_n), 0);
     uint32_t len = ntohl(len_n);
 
+
     unsigned char *b = new unsigned char[len];
     recv(client_sock, b, len, MSG_WAITALL);
-    std::cout << "[Verifier] Received m1 (" << len << " bytes)\n";
+    printf("[Verifier] Received m1 (%d bytes)\n", len);
 
     message_t *m1 = message_from_bytes(b, len);
     message_t *m2 = message_init();
@@ -85,7 +85,7 @@ int main() {
     uint32_t resp_len_n = htonl(m2->length);
     send(client_sock, &resp_len_n, sizeof(resp_len_n), 0);
     send(client_sock, m2->bytes, m2->length, 0);
-    std::cout << "[Verifier] Sent m2 (" << m2->length << " bytes)\n";
+    printf("[Verifier] Sent m2 (%ld bytes)\n", m2->length);
 
     close(client_sock);
     close(serv_sock);

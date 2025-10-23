@@ -89,17 +89,52 @@
 #include "groupsig/message.h"
 // }
 
+// 鍵をファイルから読み込み
+groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror("fopen");
+        return NULL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    rewind(f);
+
+    byte_t *buf = (byte_t *)malloc(len);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+
+    // fread(buf, 1, len, f);
+    size_t read_bytes = fread(buf, 1, len, f);
+    fclose(f);
+    if (read_bytes != (size_t)len) {
+        fprintf(stderr, "Warning: expected %ld bytes, but read %zu bytes from %s\n",
+                len, read_bytes, path);
+    }
+
+    printf("File length before import: %ld\n", len);
+    groupsig_key_t *key = import_func(scheme, buf, len);
+    // int grpkey_size = groupsig_grp_key_get_size(key);
+    // printf("Group Public Key Size: %d bytes\n", grpkey_size);
+    free(buf);
+    return key;
+}
+
+
 int main() {
     groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));
 
     // --- Setup --- グループの公開鍵(pk_g)とマネージャ鍵(sk_g)の生成
-    groupsig_key_t *grpkey = groupsig_grp_key_init(GROUPSIG_KTY04_CODE);
+    groupsig_key_t *grpkey = load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);//groupsig_grp_key_init(GROUPSIG_KTY04_CODE);
     // printf("grpkey: %p\n", grpkey);
-    groupsig_key_t *mgrkey = groupsig_mgr_key_init(GROUPSIG_KTY04_CODE);
+    groupsig_key_t *mgrkey = load_key_from_file("mgrkey.pem", GROUPSIG_KTY04_CODE, groupsig_mgr_key_import);//groupsig_mgr_key_init(GROUPSIG_KTY04_CODE);
     gml_t *gml = gml_init(GROUPSIG_KTY04_CODE); // グループメンバーリスト
     crl_t *crl = crl_init(GROUPSIG_KTY04_CODE); // 失効リスト
 
-    groupsig_setup(GROUPSIG_KTY04_CODE, grpkey, mgrkey, gml);
+    // groupsig_setup(GROUPSIG_KTY04_CODE, grpkey, mgrkey, gml);//新規作成のみ使用!!!!
 
     // --- Join ---
     groupsig_key_t *memkey = groupsig_mem_key_init(GROUPSIG_KTY04_CODE); // メンバー鍵

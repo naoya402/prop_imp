@@ -81,7 +81,7 @@ int main(void) {
     memcpy(sid, inq + offset, SID_LEN); offset += SID_LEN;
     // print_hex("SID", sid, SID_LEN);
 
-    // ***********************stateから前ホップとτを取得
+    // stateから前ホップとτを取得
     int prev_addr = 0; //me->state[0].prev_addr; // 本来はsidからstateのアドレスを取得
     // // 受信側で τ0 を生成(検証用 本来は state から取得)
     Node *no = &nodes[prev_addr];

@@ -6,8 +6,7 @@
 #include "func.h"
 
 // 鍵をファイルから読み込み
-groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme,
-                                   groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
+groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         perror("fopen");
