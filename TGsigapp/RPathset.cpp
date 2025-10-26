@@ -6,8 +6,7 @@
 #include "func.h"
 
 // 鍵をファイルから読み込み
-groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme,
-                                   groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
+groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         perror("fopen");
@@ -52,13 +51,13 @@ int main() {
     unsigned char sid[SID_LEN];
     hash_sid_from_pub(kC_pub, sid);
     // print_hex("SID (Receiver)", sid, SID_LEN);
-    // // 受信側で τ4 を生成(復路の検証用 本来は state から取得)
-    // Node *n3 = &nodes[3];
-    // unsigned char t[SIG_LEN];
-    // size_t tau_len = SIG_LEN, g_len;
-    // unsigned char *g = concat2(sid, SID_LEN, n3->addr, 4, &g_len);
-    // sign_data(n3->sk, g, g_len, t, &tau_len);
-    // free(g);
+    // 受信側で τ4 を生成(復路の検証用&通報用 本来は state から取得)
+    Node *nod = &nodes[4];
+    unsigned char t[SIG_LEN];
+    size_t t_len = SIG_LEN, g_len;
+    unsigned char *g = concat2(sid, SID_LEN, nod->addr, 4, &g_len);
+    sign_data(nod->sk, g, g_len, t, &t_len);
+    free(g);
 
     // // DPDK初期化（あなたの環境に合わせて）
     // uint16_t portid = 0;
@@ -226,7 +225,7 @@ int main() {
         if (router_handle_forward(frame, nodes) != 0) die("forward fail");
     }
 
-    // レシーバRの処理
+    // レシーバRの処理=======ここから本来RPathsetup.cpp=========
     // printf("\n=== Node R(R%d) ===\n", NODES - 1);
     // Node *
     me = &nodes[NODES-1];
@@ -357,7 +356,7 @@ int main() {
     memset(frame, 0, sizeof(frame));
     write_l2l3_min(frame, sizeof(frame));
     wire_len = build_overlay_data_trans(frame, sizeof(frame), &pkt);
-    printf("Data Trans frame wire_len=%zu \n", wire_len);
+    // printf("Data Trans frame wire_len=%zu \n", wire_len);
 
     // 各ノードの処理: state.next で転送
     int cur = nodes[1].id;
@@ -395,9 +394,9 @@ int main() {
         // トラフィックを通報
         // 本来は保存したS_pubとsigを使う
         // 以下の要素をすべて連結 sig_lenとpkt_len
-        // S_pub,sig,pkt,plain,node[NODES-1].sess_key,pi_concat,state_get_prev(me,pkt.h.sid),sigma_s
-        size_t r1_len, r2_len, r3_len, r4_len, r5_len, r6_len, r7_len, r8_len, r9_len;
-        unsigned char *r1=NULL, *r2=NULL, *r3=NULL, *r4=NULL, *r5=NULL, *r6=NULL, *r7=NULL,*r8=NULL,*r9=NULL;
+        // S_pub,sig,pkt,plain,node[NODES-1].sess_key,pi_concat,state_get_prev(me,pkt.h.sid),τ,sigma_s
+        size_t r1_len, r2_len, r3_len, r4_len, r5_len, r6_len, r7_len, r8_len, r9_len, r10_len, report_len;
+        unsigned char *r1=NULL, *r2=NULL, *r3=NULL, *r4=NULL, *r5=NULL, *r6=NULL, *r7=NULL,*r8=NULL,*r9=NULL,*r10=NULL, *report=NULL;
 
         // unsigned char k_S[PUB_LEN];
         // memcpy(k_S, kS_pub, PUB_LEN);
@@ -414,30 +413,32 @@ int main() {
         size_t l2l3_len = write_l2l3_min(frame, sizeof(frame));
         size_t total_len = l2l3_len + wire_len;
         
-        r1 = concat2(kS_pub, PUB_LEN, (unsigned char *)&sig_size, sizeof(sig_size), &r1_len);// 32 + 2034
+        r1 = concat2(kS_pub, PUB_LEN, (unsigned char *)&sig_size, sizeof(sig_size), &r1_len);// 32 + 2034B
         // print_hex("r1", r1, r1_len);
         r2 = concat2(r1, r1_len, (unsigned char *)sig_bytes, sig_size, &r2_len);// +4B
         // print_hex("r2", r2, r2_len);
         // printf("wire_len: %lu\n", wire_len);
         r3 = concat2(r2, r2_len, (unsigned char *)&total_len, sizeof(total_len), &r3_len);// +8B
         // print_hex("r3", r3, r3_len);
-        r4 = concat2(r3, r3_len, frame, total_len, &r4_len); // 237B
+        r4 = concat2(r3, r3_len, frame, total_len, &r4_len); // 34 + 205B
+        // print_hex("r4", r4, r4_len);
         r5 = concat2(r4, r4_len, plain, (int)pkt.p.ct_len, &r5_len); // +11B
         r6 = concat2(r5, r5_len, nodes[NODES-1].sess_key, KEY_LEN, &r6_len); // +32B
         r7 = concat2(r6, r6_len, pkt.h.pi_concat, MAX_PI, &r7_len);// 320B
         int prev_state = ROUTERS;//state_get_prev(me, pkt.h.sid); //本来アドレスを返す
-        r8 = concat2(r7, r7_len, (unsigned char *)&prev_state, sizeof(prev_state), &r8_len);
-        // print_hex("r8", r8, r8_len);
+        r8 = concat2(r7, r7_len, (unsigned char *)&prev_state, sizeof(prev_state), &r8_len);// +4B
+        r9 = concat2(r8, r8_len, t, SIG_LEN, &r9_len); // +64B
+        // print_hex("r9", r9, r9_len);
+        r10 = concat2(r9, r9_len, nodes[NODES-1].rand_val, sizeof(nodes[NODES-1].rand_val), &r10_len); // +4B
 
         unsigned char sigma_r[SIG_LEN];
         size_t sigma_r_len = SIG_LEN;
 
-        sign_data(nodes[NODES-1].sk, r8, r8_len, sigma_r, &sigma_r_len);
+        sign_data(nodes[NODES-1].sk, r9, r9_len, sigma_r, &sigma_r_len);
         print_hex("σ_R (signature by receiver)", sigma_r, sigma_r_len);
-        r9 = concat2(r8, r8_len, sigma_r, sigma_r_len, &r9_len);
-        // print_hex("r9", r9, r9_len);
+        report = concat2(r10, r10_len, sigma_r, sigma_r_len, &report_len);
         
-        // --- r9 を送信 ---
+        // --- report を送信 ---
         // === ソケット送信 ===
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in serv_addr{};
@@ -450,11 +451,11 @@ int main() {
             return 1;
         }
 
-        uint32_t resp_len_n = htonl(r9_len);
+        uint32_t resp_len_n = htonl(report_len);
         send(sock, &resp_len_n, sizeof(resp_len_n), 0);
-        send(sock, r9, r9_len, 0);
+        send(sock, report, report_len, 0);
         close(sock);
-        printf("[R] Sent report (%zu bytes) to sender\n", r9_len);
+        printf("[R] Sent report (%zu bytes) to sender\n", report_len);
         free(r1); free(r2); free(r3); free(r4); free(r5); free(r6); free(r7); free(r8); free(r9);
         
 

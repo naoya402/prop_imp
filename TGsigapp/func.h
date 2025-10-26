@@ -5,9 +5,14 @@
 #include <fstream>
 #include <vector>
 #include <cstring>
+#include <ctime>
+
+
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <ctime>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -15,6 +20,12 @@
 #include <openssl/sha.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // #include "groupsig/groupsig.h"
 // #include "groupsig/gml.h"
@@ -32,7 +43,7 @@
 #define ETH_LEN 14     // VLAN 無し
 #define IP_LEN  20
 #define SID_LEN 32
-#define CID_LEN 2
+#define CID_LEN 32
 #define PUB_LEN 32
 #define SEC_LEN 32
 #define KEY_LEN 32
@@ -41,13 +52,16 @@
 #define IV_LEN  12
 #define MAX_SEG_CON (ROUTERS + 1) * (SEG_LEN + TAG_LEN + IV_LEN)
 #define SIG_LEN 64
+#define USIG_LEN 33
 #define GSIG_LEN 2040
-#define MAX_PI ((ROUTERS + 1) * SIG_LEN)
+#define MAX_PI ((ROUTERS + 1) * USIG_LEN)
 #define ACSEG_LEN 32
 // #define MAX_ACSEG_CON ROUTERS * ACSEG_LEN
 #define MAX_PTXT 1024
 #define MAX_PKT  4096
 #define MAX_STATE  8
+
+#define CURVE_NID NID_secp256k1
 
  
 extern enum{ SETUP_REQ = 1, SETUP_RESP = 2, DATA_TRANS = 3 } Status;
@@ -90,7 +104,7 @@ typedef struct {
 } __attribute__((packed)) IPv4Hdr;
 
 // ---- 共通ヘッダ ----
-// SID(32) | CID(2) | STATUS(1) | idx(1)
+// SID(32) | CID(32) | STATUS(1) | idx(1)
 typedef struct {
     unsigned char sid[SID_LEN];  // セッションID
     unsigned char cid[CID_LEN];      // サーキットID
@@ -107,7 +121,7 @@ typedef struct {
     unsigned char rho[2][SIG_LEN];             // ρ データ
 
     // DATA_TRANS ヘッダ: アカウンタビリティセグメント
-    unsigned char acseg_concat[SIG_LEN];       // アカウンタビリティセグメント
+    unsigned char acseg_concat[ACSEG_LEN];       // アカウンタビリティセグメント
 
 } Oheader;
 
@@ -155,6 +169,10 @@ typedef struct {
     EVP_PKEY *sk;
     EVP_PKEY *pk;
 
+    // US 鍵
+    BIGNUM *us_x; // 秘密鍵
+    EC_POINT *us_y; // 公開鍵
+
     // セッション鍵
     //センダーは全ノード分(k)、レシーバは自ノード分のみ(ki)
     unsigned char k[NODES][KEY_LEN];//各ノードとの共有鍵
@@ -176,6 +194,12 @@ typedef struct {
         size_t tau_len;
     } state[MAX_STATE];
 } Node;
+
+typedef struct {
+    EC_GROUP *group;
+    BIGNUM *order;
+    BN_CTX *ctx;
+} US_CTX; // US 公開パラメータ
 
 // 関数プロトタイプ宣言
 void die(const char *msg);
@@ -223,5 +247,20 @@ int router_handle_forward(unsigned char *frame, Node *nodes);
 int router_handle_reverse(unsigned char *frame, Node *nodes);
 int router_handle_data_trans(unsigned char *frame, Node *nodes);
 int apply_policy_contract(const char *msg);
+US_CTX* US_init(const char *curve_name);
+void US_free(US_CTX *us);
+int hash_to_scalar(US_CTX *us, unsigned char *msg, size_t msglen, BIGNUM *out);
+int US_sign(US_CTX *us, unsigned char *message, size_t message_len, BIGNUM *x, unsigned char **sig, size_t *sig_len);
+int US_challenge(US_CTX *us, unsigned char *sig, size_t sig_len, EC_POINT *Y, BIGNUM *a, BIGNUM *b, EC_POINT *W);
+int US_response(US_CTX *us, EC_POINT *W, BIGNUM *x, EC_POINT *R);
+int US_verify(US_CTX *us, EC_POINT *R, EC_POINT *M, BIGNUM *a, BIGNUM *b);
+int save_us_x_pem(BIGNUM *x, const char *filename);
+BIGNUM *load_us_x_pem(const char *filename);
+
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -103,7 +103,7 @@ EVP_PKEY* gen_ed25519_keypair(void) {
     return pkey;
 }
 
-EVP_PKEY* extract_public_only(const EVP_PKEY *priv) {
+EVP_PKEY* extract_public_only(EVP_PKEY *priv) {
     unsigned char pub[PUB_LEN];
     size_t publen = sizeof(pub);
     if (EVP_PKEY_get_raw_public_key(priv, pub, &publen) <= 0)
@@ -127,7 +127,7 @@ unsigned char* concat2(const unsigned char *a, size_t alen, const unsigned char 
 }
 
 // Ed25519 署名・検証
-// 初期化処理（
+// 初期化処理
 void init_crypto(EVP_PKEY *sk, EVP_PKEY *pk) {
     mdctx1 = EVP_MD_CTX_new();
     if (!mdctx1) die_ossl("EVP_MD_CTX_new sign");
@@ -213,21 +213,38 @@ void node_init(Node *node, int id, const char *addr) {
    //  node->pk = extract_public_only(node->sk);
    //  save_ed25519_seckey_pem(node->sk, "ed25519_sec.pem");
    //  save_ed25519_pubkey_pem(node->pk, "ed25519_pub.pem");
+   node->dh_sk = load_ed25519_seckey_pem("dh_sec.pem");//gen_x25519_keypair();//ここでファイル読み込みしたい
+   unsigned char pub[PUB_LEN];
+   get_raw_pub(node->dh_sk, pub);
+   node->dh_pk = import_x25519_pub(pub);
+
     node->sk = load_ed25519_seckey_pem("ed25519_sec.pem"); // 既存秘密鍵の読み込み
     node->pk = load_ed25519_pubkey_pem("ed25519_pub.pem"); // 既存公開鍵の読み込み
     init_crypto(node->sk, node->pk);// 今はどのノードの鍵も一緒なので自身の鍵で初期化しておく
 
 
-    node->dh_sk = load_ed25519_seckey_pem("dh_sec.pem");//gen_x25519_keypair();//ここでファイル読み込みしたい
-    unsigned char pub[PUB_LEN];
-    get_raw_pub(node->dh_sk, pub);
-    node->dh_pk = import_x25519_pub(pub);
-    // RAND_bytes(node->addr, sizeof(node->addr));
+    US_CTX *us = US_init("secp256k1");
+    node->us_x = load_us_x_pem("us_x.pem");
+    if (!node->us_x) {
+        node->us_x = BN_new();
+        BN_rand_range(node->us_x, us->order);
+        save_us_x_pem(node->us_x, "us_x.pem");  // 初回のみ保存
+    }
+    // === us_x の値を出力 ===
+    char *us_x_hex = BN_bn2hex(node->us_x);
+    // if (us_x_hex) {
+    //     printf("[node_init] us_x = %s\n", us_x_hex);
+    //     OPENSSL_free(us_x_hex);
+    // } else {
+    //     fprintf(stderr, "[node_init] Failed to convert us_x to hex.\n");
+    // }
+    // node->us_x = BN_new();
+    // BN_rand_range(node->us_x, us->order);
+    node->us_y = EC_POINT_new(us->group);
+    const EC_POINT *G = EC_GROUP_get0_generator(us->group);
+    EC_POINT_mul(us->group, node->us_y, NULL, G, node->us_x, us->ctx);
+
    //  // IPv4アドレスの設定
-   //  inet_pton(AF_INET, addr, &ipv4_addr);
-   //  printf("IPv4 address: %s\n", inet_ntoa(ipv4_addr));
-    // nodeのaddrにaddrをコピー
-   //  rte_memcpy(node->addr, addr, sizeof(node->addr));
    if (inet_pton(AF_INET, addr, node->addr) != 1) {
         die("inet_pton failed in prev_node_init");
     }
@@ -340,7 +357,7 @@ int load_pi_list(const char *filename, unsigned char sid[SID_LEN], unsigned char
 }
 
 //========= オーバーレイ領域ヘッダ & ペイロード=========
-size_t overlay_header_footprint(void) { return SID_LEN + CID_LEN + 1 + 1 + 4; }//固定へッダ長
+size_t overlay_header_footprint(void) { return SID_LEN + CID_LEN + 1 + 1; }//固定へッダ長
 
 // L2/L3 ダミーを埋めて最小 IPv4 ヘッダ(IHL = 5)作成
 size_t write_l2l3_min(unsigned char *buf, size_t buf_cap) {
@@ -372,7 +389,7 @@ size_t l3_overlay_offset(const unsigned char *l2) {
 // SETUP_REQ を 34B(=L3末) から書く
 size_t build_overlay_setup_req(unsigned char *l2, size_t cap, const Packet *pkt) {
     size_t off = l3_overlay_offset(l2);
-    size_t need = off + overlay_header_footprint() + (pkt->h.idx - 1) * SIG_LEN + SIG_LEN + PUB_LEN;
+    size_t need = off + overlay_header_footprint() + (pkt->h.idx - 1) * USIG_LEN + SIG_LEN + PUB_LEN;
     if (cap < need) die("cap too small (setup req)");
     unsigned char *p = l2 + off; //現在の位置 ＋ L2L3オフセット
     // ヘッダ
@@ -385,8 +402,8 @@ size_t build_overlay_setup_req(unsigned char *l2, size_t cap, const Packet *pkt)
     // seg_concatを乗せる
     memcpy(p, pkt->h.seg_concat, MAX_SEG_CON); p += MAX_SEG_CON; // segリストは固定長
     // print_hex("pkt.h.seg_concat", pkt->h.seg_concat, MAX_SEG_CON);
-    memcpy(p, pkt->h.pi_concat, (pkt->h.idx - 1) * SIG_LEN); p += (pkt->h.idx - 1) * SIG_LEN; // πリストは固定長
-    // print_hex("pkt.h.pi_concat", pkt->h.pi_concat, (pkt->h.idx - 1) * SIG_LEN);
+    memcpy(p, pkt->h.pi_concat, (pkt->h.idx - 1) * USIG_LEN); p += (pkt->h.idx - 1) * USIG_LEN; // πリストは固定長
+    // print_hex("pkt.h.pi_concat", pkt->h.pi_concat, (pkt->h.idx - 1) * USIG_LEN);
 
     // ぺイロード
     memcpy(p, pkt->p.tau, SIG_LEN); p += SIG_LEN; //固定長で送る
@@ -394,7 +411,7 @@ size_t build_overlay_setup_req(unsigned char *l2, size_t cap, const Packet *pkt)
     memcpy(p, pkt->p.peer_pub, PUB_LEN); p += PUB_LEN;
     // print_hex("pkt.p.peer_pub", pkt->p.peer_pub, PUB_LEN);
     // print_hex("Built SETUP_REQ", l2 + off, (size_t)(p - l2 - off));
-    // 署名長もpに乗せる
+    // グループ署名の署名長もpに乗せる
     uint32_t sig_len_n = htonl(pkt->p.sig_len);
     memcpy(p, &sig_len_n, sizeof(sig_len_n));
     // print_hex("pkt.p.sig_len", p, sizeof(sig_len_n));
@@ -430,12 +447,14 @@ size_t build_overlay_setup_resp(unsigned char *l2, size_t cap, const Packet *pkt
 size_t build_overlay_data_trans(unsigned char *l2, size_t cap, const Packet *pkt) {
     size_t off = l3_overlay_offset(l2);
     uint16_t ctlen = (uint16_t)pkt->p.ct_len;
+
     size_t need = off + overlay_header_footprint() +  (pkt->h.idx - 1) * ACSEG_LEN + IV_LEN + 2 + ctlen + TAG_LEN;
-    if (cap < need) die("cap too small (data trans)");
+    // if (cap < need) die("cap too small (data trans)");
     unsigned char *p = l2 + off;
     // ヘッダ
     memcpy(p, pkt->h.sid, SID_LEN); p += SID_LEN;
-    memcpy(p, &pkt->h.cid, 1); p += CID_LEN;
+    // print_hex( "pkt.h.cid", pkt->h.cid, CID_LEN);
+    memcpy(p, &pkt->h.cid, CID_LEN); p += CID_LEN;
     *p++ = pkt->h.status;
     *p++ = pkt->h.idx;
     memcpy(p, pkt->h.acseg_concat, (pkt->h.idx - 1) * ACSEG_LEN); p += (pkt->h.idx - 1) * ACSEG_LEN;
@@ -470,10 +489,10 @@ int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt
         // print_hex("pkt.h.seg_concat", pkt->h.seg_concat, MAX_SEG_CON);
         p += MAX_SEG_CON;
         //π_list
-        if (p + (pkt->h.idx - 1) * SIG_LEN > buf + len) return -1;
-        memcpy(pkt->h.pi_concat, p, (pkt->h.idx - 1) * SIG_LEN); // πリストはidxによる可変長で受け取る
-        // print_hex("pkt.h.pi_concat", pkt->h.pi_concat, (pkt->h.idx - 1) * SIG_LEN);
-        p += (pkt->h.idx - 1) * SIG_LEN;
+        if (p + (pkt->h.idx - 1) * USIG_LEN > buf + len) return -1;
+        memcpy(pkt->h.pi_concat, p, (pkt->h.idx - 1) * USIG_LEN); // πリストはidxによる可変長で受け取る
+        // print_hex("pkt.h.pi_concat", pkt->h.pi_concat, (pkt->h.idx - 1) * USIG_LEN);
+        p += (pkt->h.idx - 1) * USIG_LEN;
 
         //  τ + peer_pub
         if (p + SIG_LEN > buf + len) return -1;
@@ -537,8 +556,8 @@ int router_handle_forward(unsigned char *frame, Node *nodes) {
     Node *me = &nodes[idx];
     size_t m_len, n_len, m2_len;
     unsigned char *m = NULL, *n = NULL, *m2 = NULL;
-    unsigned char pi[SIG_LEN], tau[SIG_LEN];
-    size_t pi_len = SIG_LEN, tau_len = SIG_LEN;
+    unsigned char pi[USIG_LEN], tau[SIG_LEN];
+    size_t pi_len = USIG_LEN, tau_len = SIG_LEN;
 
     if (pkt.h.status != SETUP_REQ) { fprintf(stderr,"unexpected status\n"); return -1; }
 
@@ -603,19 +622,55 @@ int router_handle_forward(unsigned char *frame, Node *nodes) {
     printf("Verify τ%d success\n", prev_idx);
     free(m);
 
-    // π_i = Sign(sk_i, τ_{i-1} || r_i)
+    // π_i = Sign(sk_i, τ_{i-1} || r_i) 
     n = concat2(pkt.p.tau, SIG_LEN, me->rand_val, sizeof(me->rand_val), &n_len);
     // print_hex("n", n, n_len);
-    sign_data(me->sk, n, n_len, pi, &pi_len);
-    free(n);
-    size_t offset = (idx - 1) * SIG_LEN;
+    
+    US_CTX *us = US_init("secp256k1");
+    if (!us) { fprintf(stderr,"US_init error\n"); return 1; }
+    unsigned char *USpi = NULL; size_t USpi_len;
+    US_sign(us, n, n_len, me->us_x, &USpi, &USpi_len);
+    // BIGNUM *a = BN_new();
+    // BIGNUM *b = BN_new();
+    // EC_POINT *W = EC_POINT_new(us->group);
+    // // EC_GROUP *group1 = EC_GROUP_new_by_curve_name(CURVE_NID);
+    // if (!US_challenge(us, USpi, USpi_len, me->us_y, a, b, W)) {
+    //     fprintf(stderr,"US_challenge error\n"); return 1;
+    // }
+    // // Alice computes response
+    // EC_POINT *R = EC_POINT_new(us->group);
+    // if (!US_response(us, W, me->us_x, R)) {
+    //     fprintf(stderr,"US_response error\n"); return 1;
+    // }
 
-    if (offset + pi_len > sizeof(pkt.h.pi_concat)) {
+    // // Bob verifies
+    // // Map message -> scalar m' -> M = m'*G
+    // BIGNUM *m_scalar = BN_new();
+    // if (!hash_to_scalar(us, n, n_len, m_scalar)) {
+    //     fprintf(stderr,"hash_to_scalar error\n"); return 1;
+    // }
+    // EC_POINT *M = EC_POINT_new(us->group);
+    // const EC_POINT *G = EC_GROUP_get0_generator(us->group);
+    // if (!EC_POINT_mul(us->group, M, NULL, G, m_scalar, us->ctx)) {
+    //     fprintf(stderr,"M mul error\n"); return 1;
+    // }
+    // int ver = US_verify(us, R, M, a, b);
+    // if (ver == 1) {
+    //     printf("Signature CONFIRMED.\n");
+    // } else if (ver == 0) {
+    //     printf("Signature NOT confirmed.\n");
+    // }
+
+    // sign_data(me->sk, n, n_len, pi, &pi_len);
+    free(n);
+    size_t offset = (idx - 1) * USIG_LEN;
+
+    if (offset + USpi_len > sizeof(pkt.h.pi_concat)) {
         fprintf(stderr,"pi_concat overflow at R%d\n", idx);
         // OPENSSL_free(pi);
         return -1;
     }
-    memcpy(pkt.h.pi_concat + offset, pi, pi_len);
+    memcpy(pkt.h.pi_concat + offset, USpi, USpi_len);
     // printf("π%d", idx);print_hex(" ", pi, pi_len);
 
     // τ_i = Sign(sk_i, sid||addr) (サーバは除く)
@@ -640,7 +695,7 @@ int router_handle_forward(unsigned char *frame, Node *nodes) {
 
     // フレーム再構築
     size_t wire_len = build_overlay_setup_req(frame, frame_cap, &pkt);
-    printf("Forward frame wire_len=%zu pi_list_len=%u\n", wire_len, idx * SIG_LEN);
+    printf("Forward frame wire_len=%zu pi_list_len=%u\n", wire_len, idx * USIG_LEN);
     return 0;
 }
 
@@ -689,13 +744,13 @@ int router_handle_reverse(unsigned char *frame, Node *nodes) {
     // π_i+1 を取り出す
     size_t nidx = idx + 1;
     if (nidx == 0) { fprintf(stderr,"invalid nidx\n"); return -1; }
-    size_t offset = (nidx - 1) * SIG_LEN;
-    if (offset + SIG_LEN > MAX_PI) { 
+    size_t offset = (nidx - 1) * USIG_LEN;
+    if (offset + USIG_LEN > MAX_PI) { 
         fprintf(stderr,"pi_concat out of range\n"); 
         return -1; 
     }
     unsigned char *pi_next = pkt.h.pi_concat + offset;
-    // printf("π%d", pkt.h.idx + 1); print_hex("", pi_next, SIG_LEN);
+    // printf("π%d", pkt.h.idx + 1); print_hex("", pi_next, USIG_LEN);
 
     // τ_i を取り出す
     EVP_PKEY *sk = load_ed25519_seckey_pem("dh_sec.pem");
@@ -721,13 +776,13 @@ int router_handle_reverse(unsigned char *frame, Node *nodes) {
     size_t n_len;
     unsigned char *n = concat2(tau, SIG_LEN, pkt.p.rand_val, sizeof(pkt.p.rand_val), &n_len);
     // print_hex("n", n, n_len);
-    if (!verify_sig(nodes[nidx].pk, n, n_len, pi_next, SIG_LEN)) {
-        free(n); 
-        fprintf(stderr,"Verify π%ld failed at R%d\n", nidx, idx); 
-        return -1;
-    }
+    // if (!verify_sig(nodes[nidx].pk, n, n_len, pi_next, SIG_LEN)) {
+    //     free(n); 
+    //     fprintf(stderr,"Verify π%ld failed at R%d\n", nidx, idx); 
+    //     return -1;
+    // }
     free(n);
-    printf("Verify π%ld success \n", nidx);
+    // printf("Verify π%ld success \n", nidx);
 
     if (idx - 2 >= 0) {
         // ρ_iを生成
@@ -816,9 +871,10 @@ int router_handle_data_trans(unsigned char *frame, Node *nodes) {
     // print_hex("ACSEG", pkt.h.acseg_concat, (pkt.h.idx - 1) * ACSEG_LEN);
 
     pkt.h.idx++;
+    //本来はcidも更新
     
     size_t wire_len = build_overlay_data_trans(frame, frame_cap, &pkt);
-    printf("Data Trans frame wire_len=%zu \n", wire_len);
+    // printf("Data Trans frame wire_len=%zu \n", wire_len);
     return 0;
 }
 
@@ -834,4 +890,255 @@ int apply_policy_contract(const char *msg) {
     return 0;
 }
 
+//Undeneiable Signature
+US_CTX* US_init(const char *curve_name) {
+    int nid;
+    if (!curve_name) return NULL;
+
+    // 例：curve_name = "secp256k1"
+    nid = OBJ_txt2nid(curve_name);
+    if (nid == NID_undef) {
+        fprintf(stderr, "Error: Unknown curve name: %s\n", curve_name);
+        return NULL;
+    }
+
+    US_CTX *us = (US_CTX*)malloc(sizeof(US_CTX));
+    if (!us) return NULL;
+
+    us->ctx = BN_CTX_new();
+    if (!us->ctx) {
+        free(us);
+        return NULL;
+    }
+
+    us->group = EC_GROUP_new_by_curve_name(nid);
+    if (!us->group) {
+        BN_CTX_free(us->ctx);
+        free(us);
+        return NULL;
+    }
+
+    us->order = BN_new();
+    if (!us->order || !EC_GROUP_get_order(us->group, us->order, us->ctx)) {
+        if (us->order) BN_free(us->order);
+        EC_GROUP_free(us->group);
+        BN_CTX_free(us->ctx);
+        free(us);
+        return NULL;
+    }
+
+    return us;
+}
+
+void US_free(US_CTX *us) {
+    if (!us) return;
+    if (us->order) BN_free(us->order);
+    if (us->group) EC_GROUP_free(us->group);
+    if (us->ctx) BN_CTX_free(us->ctx);
+    free(us);
+}
+
+int hash_to_scalar(US_CTX *us, unsigned char *msg, size_t msglen, BIGNUM *out) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(msg, msglen, digest);
+    // convert digest to BIGNUM and reduce mod order
+    if (!BN_bin2bn(digest, SHA256_DIGEST_LENGTH, out)) return 0;
+    if (!BN_mod(out, out, us->order, us->ctx)) return 0;
+    // ensure non-zero
+    if (BN_is_zero(out)) if (!BN_one(out)) return 0;
+    return 1;
+}
+
+int US_sign(US_CTX *us, unsigned char *message, size_t message_len, BIGNUM *x, unsigned char **sig, size_t *sig_len){
+    if (!message || !x || !us->ctx || !sig_len) return 0;
+
+    int ret = 0;
+    BIGNUM *m_scalar = NULL;
+    EC_POINT *M = NULL;
+    EC_POINT *Z = NULL;
+    *sig = NULL;
+
+    // ensure order is set
+    if (!EC_GROUP_get_order(us->group, us->order, us->ctx)) {
+        fprintf(stderr,"EC_GROUP_get_order error\n");
+        return 0;
+    }
+
+    // 1) hash -> scalar
+    m_scalar = BN_new();
+    if (!hash_to_scalar(us, message, message_len, m_scalar)) {
+        fprintf(stderr,"hash_to_scalar error\n"); return 0;
+    }
+    // 2) M = m_scalar * G
+    M = EC_POINT_new(us->group);
+    const EC_POINT *G = EC_GROUP_get0_generator(us->group);
+    if (!EC_POINT_mul(us->group, M, NULL, G, m_scalar, us->ctx)) { fprintf(stderr,"M mul error\n"); return 0; }
+    size_t M_len = EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, NULL, 0, us->ctx);
+    unsigned char M_bytes[M_len];
+    if (!EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, M_bytes, M_len, us->ctx)) {
+        fprintf(stderr, "EC_POINT_point2oct(M) failed\n");
+        return -1;
+    }
+    // print_hex("M", M_bytes, M_len);
+
+    // 3) Z = x * M
+    Z = EC_POINT_new(us->group);
+    if (!EC_POINT_mul(us->group, Z, NULL, M, x, us->ctx)) { fprintf(stderr,"Z mul error\n"); return 0; }
+
+    // 4) serialize to compressed form
+    *sig_len = EC_POINT_point2oct(us->group, Z, POINT_CONVERSION_COMPRESSED, NULL, 0, us->ctx);
+    *sig = (unsigned char*)malloc(*sig_len);
+    if (EC_POINT_point2oct(us->group, Z, POINT_CONVERSION_COMPRESSED, *sig, *sig_len, us->ctx) != (int)*sig_len) {
+        fprintf(stderr,"EC_POINT_point2oct error\n"); return 0;
+    }
+    // print_hex("US:", *sig, *sig_len);
+
+    ret = 1;
+    if (m_scalar) BN_free(m_scalar);
+    if (M) EC_POINT_free(M);
+    if (Z) EC_POINT_free(Z);
+    return ret;
+}
+
+int US_challenge(US_CTX *us, unsigned char *sig, size_t sig_len, EC_POINT *Y, BIGNUM *a, BIGNUM *b, EC_POINT *W) {
+    if (!us || !Y || !a || !b || !W) return 0;
+
+    int ret = 0;
+    EC_POINT *aZ = NULL;
+    EC_POINT *bY = NULL;
+
+    // sample a,b in [0, order-1]
+    if (!BN_rand_range(a, us->order)) { fprintf(stderr,"BN_rand_range a error\n"); return 0; }
+    if (!BN_rand_range(b, us->order)) { fprintf(stderr,"BN_rand_range b error\n"); return 0; }
+
+    aZ = EC_POINT_new(us->group);
+    bY = EC_POINT_new(us->group);
+    if (!aZ || !bY) return 0;
+
+    EC_POINT *Z = EC_POINT_new(us->group);
+    if (!EC_POINT_oct2point(us->group, Z, sig, sig_len, us->ctx)) {
+        fprintf(stderr, "Error: Failed to restore EC point from compressed signature.\n");
+        return 1;
+    } 
+
+    // W = a*Z + b*Y
+    if (!EC_POINT_mul(us->group, aZ, NULL, Z, a, us->ctx)) { fprintf(stderr,"a*Z mul error\n"); return 0; }
+    if (!EC_POINT_mul(us->group, bY, NULL, Y, b, us->ctx)) { fprintf(stderr,"b*Y mul error\n"); return 0; }
+    if (!EC_POINT_add(us->group, W, aZ, bY, us->ctx)) { fprintf(stderr,"W add error\n"); return 0; }
+
+    ret = 1;
+    if (aZ) EC_POINT_free(aZ);
+    if (bY) EC_POINT_free(bY);
+    return ret;
+}
+
+int US_response(US_CTX *us, EC_POINT *W, BIGNUM *x, EC_POINT *R) {
+    if (!W || !x || !us->order || !us->ctx || !R) return 0;
+    int ret = 0;
+    BIGNUM *xinv = NULL;
+
+    xinv = BN_mod_inverse(NULL, x, us->order, us->ctx);
+    if (!xinv) { fprintf(stderr,"BN_mod_inverse error\n"); return 0; }
+
+    // R = x^{-1} * W
+    if (!EC_POINT_mul(us->group, R, NULL, W, xinv, us->ctx)) { fprintf(stderr,"R mul error\n"); return 0; }
+
+    // print_hex("R:", (const unsigned char*)R, 33); // compressed size for secp256k1
+
+    ret = 1;
+// cleanup:
+    if (xinv) BN_free(xinv);
+    return ret;
+}
+
+int US_verify(US_CTX *us, EC_POINT *R, EC_POINT *M, BIGNUM *a, BIGNUM *b) {
+    if (!us || !R || !M || !a || !b) return -1;
+    int ret = 0;
+    EC_POINT *aM = NULL;
+    EC_POINT *bG = NULL;
+    EC_POINT *Rprime = NULL;
+    int cmp;
+
+    aM = EC_POINT_new(us->group);
+    bG = EC_POINT_new(us->group);
+    Rprime = EC_POINT_new(us->group);
+    if (!aM || !bG || !Rprime) return -1;
+
+    const EC_POINT *G = EC_GROUP_get0_generator(us->group);
+
+    // R' = a*M + b*G
+    if (!EC_POINT_mul(us->group, aM, NULL, M, a, us->ctx)) { fprintf(stderr,"a*M error\n"); return -1; }
+    if (!EC_POINT_mul(us->group, bG, NULL, G, b, us->ctx)) { fprintf(stderr,"b*G error\n"); return -1; }
+    if (!EC_POINT_add(us->group, Rprime, aM, bG, us->ctx)) { fprintf(stderr,"R' add error\n"); return -1; }
+    size_t Rprime_buf_len = EC_POINT_point2oct(us->group, Rprime, POINT_CONVERSION_COMPRESSED, NULL, 0, us->ctx);
+    unsigned char Rprime_bytes[Rprime_buf_len];
+    if (!EC_POINT_point2oct(us->group, Rprime, POINT_CONVERSION_COMPRESSED, Rprime_bytes, Rprime_buf_len, us->ctx)) {
+        fprintf(stderr, "EC_POINT_point2oct(R') failed\n");
+        return -1;
+    }
+    // print_hex("R' bytes:", Rprime_bytes, Rprime_buf_len);
+
+    cmp = EC_POINT_cmp(us->group, R, Rprime, us->ctx);// R ?= R'
+    if (cmp == 0) {
+        ret = 1;
+    }
+
+    if (aM) EC_POINT_free(aM);
+    if (bG) EC_POINT_free(bG);
+    if (Rprime) EC_POINT_free(Rprime);
+    return ret;
+}
+
+int save_us_x_pem(BIGNUM *x, const char *filename) {
+    if (!x || !filename) return 0;
+
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("fopen");
+        return 0;
+    }
+
+    // 秘密鍵を16進文字列にして保存
+    char *hex = BN_bn2hex(x);
+    if (!hex) {
+        fclose(fp);
+        return 0;
+    }
+
+    fprintf(fp, "-----BEGIN EC PRIVATE KEY-----\n%s\n-----END EC PRIVATE KEY-----\n", hex);
+    OPENSSL_free(hex);
+    fclose(fp);
+    return 1;
+}
+
+BIGNUM *load_us_x_pem(const char *filename) {
+    if (!filename) return NULL;
+
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("fopen");
+        return NULL;
+    }
+
+    char buf[256];
+    char hex[256] = {0};
+    int found = 0;
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (strstr(buf, "BEGIN") || strstr(buf, "END")) continue;
+        strcat(hex, buf);
+        found = 1;
+    }
+    fclose(fp);
+    if (!found) return NULL;
+
+    // 改行を除去
+    hex[strcspn(hex, "\r\n")] = 0;
+
+    BIGNUM *x = NULL;
+    if (!BN_hex2bn(&x, hex)) {
+        fprintf(stderr, "BN_hex2bn failed for %s\n", filename);
+        return NULL;
+    }
+    return x;
+}
 
