@@ -435,9 +435,15 @@ size_t build_overlay_setup_resp(unsigned char *l2, size_t cap, const Packet *pkt
     // printf("R%d\n", pkt->h.idx);
     memcpy(p, pkt->h.pi_concat, MAX_PI); p += MAX_PI; //固定長で送る
     memcpy(p, pkt->h.rho, SIG_LEN * 2); p += SIG_LEN * 2; //固定長で送る
-    // print_hex("rho", pkt->h.rho, SIG_LEN*2);
+    // print_hex("rho", pkt->h.rho[1], SIG_LEN);
     // ペイロード
     memcpy(p, pkt->p.rand_val, sizeof(pkt->p.rand_val)); p += sizeof(pkt->p.rand_val); // 4
+    // print_hex("pkt.p.rand_val", pkt->p.rand_val, sizeof(pkt->p.rand_val));
+    uint32_t nizk_sig_len_n = htonl(pkt->p.nizk_sig_len);
+    memcpy(p, &nizk_sig_len_n, sizeof(nizk_sig_len_n));
+    // print_hex("pkt.p.sig_len", p, sizeof(nizk_sig_len_n));
+    p += sizeof(nizk_sig_len_n);
+    memcpy(p, pkt->p.nizk_sig, pkt->p.nizk_sig_len); p += pkt->p.nizk_sig_len;
     memcpy(p, pkt->p.peer_pub, PUB_LEN); p += PUB_LEN; //32
 
     return (size_t)(p - l2 - off);
@@ -518,13 +524,24 @@ int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt
         // ρ
         if (p + SIG_LEN * 2 > buf + len) return -1;
         memcpy(pkt->h.rho, p, SIG_LEN * 2); p += SIG_LEN * 2;
-        // print_hex("rho", pkt->h.rho, SIG_LEN*2);
+        // print_hex("rho", pkt->h.rho[1], SIG_LEN);
 
         // rand_val + peer_pub
         if (p + 4 > buf + len) return -1;
         memcpy(pkt->p.rand_val, p, 4); p += 4;
+        // print_hex("rand_val", pkt->p.rand_val, 4);
+        uint32_t nizk_sig_len_n;
+        memcpy(&nizk_sig_len_n, p, sizeof(nizk_sig_len_n));
+        // print_hex("pkt.p.sig_len", p, sizeof(nizk_sig_len_n));
+        pkt->p.nizk_sig_len = ntohl(nizk_sig_len_n);
+        // printf ("nizk_sig_len: %lu\n", pkt->p.nizk_sig_len);
+        p += sizeof(nizk_sig_len_n);
+        if (p + pkt->p.nizk_sig_len > buf + len) return -1;
+        pkt->p.nizk_sig = (unsigned char *)malloc(pkt->p.nizk_sig_len);
+        memcpy(pkt->p.nizk_sig, p, pkt->p.nizk_sig_len); p += pkt->p.nizk_sig_len;
         if (p + PUB_LEN > buf + len) return -1;
         memcpy(pkt->p.peer_pub, p, PUB_LEN); p += PUB_LEN;
+        // print_hex("pkt.p.peer_pub", pkt->p.peer_pub, PUB_LEN);
     } else if (pkt->h.status == DATA_TRANS) {
         if (p + (pkt->h.idx - 1) * ACSEG_LEN > buf + len) return -1;
         memcpy(pkt->h.acseg_concat, p, (pkt->h.idx - 1) * ACSEG_LEN); p += (pkt->h.idx - 1) * ACSEG_LEN;
@@ -671,7 +688,7 @@ int router_handle_forward(unsigned char *frame, Node *nodes) {
         return -1;
     }
     memcpy(pkt.h.pi_concat + offset, USpi, USpi_len);
-    // printf("π%d", idx);print_hex(" ", pi, pi_len);
+    printf("π%d", idx);print_hex(" ", USpi, USpi_len);
 
     // τ_i = Sign(sk_i, sid||addr) (サーバは除く)
     if (me->id != NODES-1) {
@@ -701,6 +718,7 @@ int router_handle_forward(unsigned char *frame, Node *nodes) {
 
 // ルータ処理（SETUP_RESPの中継）
 int router_handle_reverse(unsigned char *frame, Node *nodes) {
+    US_CTX *us = US_init("secp256k1");
     Packet pkt;
     size_t frame_cap = MAX_FRAME;
     if (parse_frame_to_pkt(frame, frame_cap, &pkt) != 0) {
@@ -760,13 +778,12 @@ int router_handle_reverse(unsigned char *frame, Node *nodes) {
     unsigned char sid[SID_LEN];
     hash_sid_from_pub(kC_pub, sid);
     // print_hex("SID (Receiver)", sid, SID_LEN);
-    // 受信側で τ4 を生成(復路の検証用 本来は state から取得)
-    Node *ni = &nodes[pkt.h.idx];
+    // 受信側で τ を生成(復路の検証用 本来は state から取得)
     unsigned char t[SIG_LEN];
     size_t tau_len = SIG_LEN, g_len;
-    unsigned char *g = concat2(sid, SID_LEN, ni->addr, 4, &g_len);
+    unsigned char *g = concat2(sid, SID_LEN, me->addr, 4, &g_len);
     // print_hex("g", g, g_len);
-    sign_data(ni->sk, g, g_len, t, &tau_len);
+    sign_data(me->sk, g, g_len, t, &tau_len);
     // print_hex("τ", t, tau_len);
     free(g);
     const unsigned char *tau = t;//state_get_tau(me, pkt.h.sid);
@@ -776,11 +793,15 @@ int router_handle_reverse(unsigned char *frame, Node *nodes) {
     size_t n_len;
     unsigned char *n = concat2(tau, SIG_LEN, pkt.p.rand_val, sizeof(pkt.p.rand_val), &n_len);
     // print_hex("n", n, n_len);
-    // if (!verify_sig(nodes[nidx].pk, n, n_len, pi_next, SIG_LEN)) {
-    //     free(n); 
-    //     fprintf(stderr,"Verify π%ld failed at R%d\n", nidx, idx); 
-    //     return -1;
-    // }
+    // print_hex("pkt.p.nizk_sig", pkt.p.nizk_sig, pkt.p.nizk_sig_len);
+    int ver = US_NIZK_Verify(us, me->us_y, n, n_len, pi_next, USIG_LEN, pkt.p.nizk_sig, pkt.p.nizk_sig_len);
+    // printf("US_NIZK_Verify result: %d\n", ver);
+    if (ver == 0) {
+        fprintf(stderr,"Verify π%ld failed\n", nidx);
+        free(n);
+        return -1;
+    }
+    printf("Verify π%ld success \n", nidx);
     free(n);
     // printf("Verify π%ld success \n", nidx);
 
@@ -792,6 +813,37 @@ int router_handle_reverse(unsigned char *frame, Node *nodes) {
         sign_data(me->sk, m, m_len, pkt.h.rho[idx % 2], &rho_len);
         free(m);
         // print_hex("ρ", (unsigned char *)pkt.h.rho, SIG_LEN*2);
+    }
+
+    if (idx - 1 >= 0) {
+        size_t nt_len = SIG_LEN, g2_len, nizp_len, nizk_sig_len;
+        unsigned char nt[SIG_LEN];
+        unsigned char *nizp = NULL;
+        unsigned char *nizk_sig = NULL;
+        unsigned char *g2 = concat2(sid, SID_LEN, nodes[idx - 1].addr, 4, &g2_len);
+        // print_hex("g", g2, g2_len);
+        sign_data(me->sk, g2, g2_len, nt, &nt_len);// 本来のτ_Rは state から取得
+        // print_hex("nt", nt, nt_len);
+        nizp = concat2(nt, nt_len, me->rand_val, sizeof(me->rand_val), &nizp_len);// 本来の乱数は state から取得
+        // print_hex("nizp", nizp, nizp_len);
+        // π_i を取り出す
+        size_t offset_cur = (idx - 1) * USIG_LEN;
+        if (offset_cur + USIG_LEN > MAX_PI) { 
+            fprintf(stderr,"pi_concat out of range\n"); 
+            return -1; 
+        }
+        unsigned char *pi_cur = pkt.h.pi_concat + offset_cur;
+        // print_hex("pi_cur", pi_cur, USIG_LEN);
+        int ver = US_NIZK_Sign(us, nizp, nizp_len, me->us_x, me->us_y, pi_cur, USIG_LEN, &nizk_sig, &nizk_sig_len);
+        if (!ver) { fprintf(stderr,"US_NIZK_Sign error at R%d\n", idx); return 1; }
+        pkt.p.nizk_sig_len = nizk_sig_len;
+        // printf("nizk_sig_len: %zu\n", nizk_sig_len);
+        pkt.p.nizk_sig = (unsigned char *)malloc(nizk_sig_len);
+        memcpy(pkt.p.nizk_sig, nizk_sig, nizk_sig_len);
+        // print_hex("nizk_sig", nizk_sig, nizk_sig_len);
+        free(nizp);
+        free(nizk_sig);
+        free(g2);
     }
     
 
@@ -1015,6 +1067,7 @@ int US_challenge(US_CTX *us, unsigned char *sig, size_t sig_len, EC_POINT *Y, BI
     bY = EC_POINT_new(us->group);
     if (!aZ || !bY) return 0;
 
+    // restore Z from sig
     EC_POINT *Z = EC_POINT_new(us->group);
     if (!EC_POINT_oct2point(us->group, Z, sig, sig_len, us->ctx)) {
         fprintf(stderr, "Error: Failed to restore EC point from compressed signature.\n");
@@ -1051,8 +1104,8 @@ int US_response(US_CTX *us, EC_POINT *W, BIGNUM *x, EC_POINT *R) {
     return ret;
 }
 
-int US_verify(US_CTX *us, EC_POINT *R, EC_POINT *M, BIGNUM *a, BIGNUM *b) {
-    if (!us || !R || !M || !a || !b) return -1;
+int US_verify(US_CTX *us, EC_POINT *R, unsigned char *message, size_t message_len, BIGNUM *a, BIGNUM *b) {
+    if (!us || !R || !message || !a || !b) return -1;
     int ret = 0;
     EC_POINT *aM = NULL;
     EC_POINT *bG = NULL;
@@ -1065,6 +1118,23 @@ int US_verify(US_CTX *us, EC_POINT *R, EC_POINT *M, BIGNUM *a, BIGNUM *b) {
     if (!aM || !bG || !Rprime) return -1;
 
     const EC_POINT *G = EC_GROUP_get0_generator(us->group);
+    // Map message -> scalar m' -> M = m'*G
+    BIGNUM *m_scalar = BN_new();
+    if (!hash_to_scalar(us, message, message_len, m_scalar)) {
+        fprintf(stderr,"hash_to_scalar error\n"); return 1;
+    }
+    EC_POINT *M = EC_POINT_new(us->group);
+    if (!EC_POINT_mul(us->group, M, NULL, G, m_scalar, us->ctx)) {
+        fprintf(stderr,"M mul error\n"); return 1;
+    }
+    size_t M_len = EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, NULL, 0, us->ctx);
+    unsigned char M_bytes[M_len];
+    if (!EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, M_bytes, M_len, us->ctx)) {
+        fprintf(stderr, "EC_POINT_point2oct(M) failed\n");
+        return 
+        -1;
+    }
+    // print_hex("M bytes:", M_bytes, M_len);
 
     // R' = a*M + b*G
     if (!EC_POINT_mul(us->group, aM, NULL, M, a, us->ctx)) { fprintf(stderr,"a*M error\n"); return -1; }
@@ -1087,6 +1157,180 @@ int US_verify(US_CTX *us, EC_POINT *R, EC_POINT *M, BIGNUM *a, BIGNUM *b) {
     if (bG) EC_POINT_free(bG);
     if (Rprime) EC_POINT_free(Rprime);
     return ret;
+}
+
+int US_NIZK_Sign(US_CTX *us, unsigned char *message, size_t message_len, BIGNUM *x, EC_POINT *Y, unsigned char *sig, size_t sig_len, unsigned char **out_sig, size_t *out_sig_len) {
+    BN_CTX *ctx = us->ctx;
+    const EC_POINT *G = EC_GROUP_get0_generator(us->group);
+
+    // --- 1. M = H(message) * G ---
+    BIGNUM *m_scalar = BN_new();
+    hash_to_scalar(us, message, message_len, m_scalar);
+    EC_POINT *M = EC_POINT_new(us->group);
+    EC_POINT_mul(us->group, M, NULL, G, m_scalar, ctx);
+
+    // --- 2. Z を復元 ---
+    EC_POINT *Z = EC_POINT_new(us->group);
+    EC_POINT_oct2point(us->group, Z, sig, sig_len, ctx);
+
+    // --- 3. ランダム k, A = kG, B = kM ---
+    BIGNUM *k = BN_new();
+    BN_rand_range(k, us->order);
+    EC_POINT *A = EC_POINT_new(us->group);
+    EC_POINT *B = EC_POINT_new(us->group);
+    EC_POINT_mul(us->group, A, NULL, G, k, ctx);
+    EC_POINT_mul(us->group, B, NULL, M, k, ctx);
+
+    // --- 4. 各点を圧縮形式に変換(encode) ---
+    size_t M_len = EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+    size_t Y_len = EC_POINT_point2oct(us->group, Y, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+    size_t Z_len = EC_POINT_point2oct(us->group, Z, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+    size_t A_len = EC_POINT_point2oct(us->group, A, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+    size_t B_len = EC_POINT_point2oct(us->group, B, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+
+    unsigned char M_bytes[M_len], Y_bytes[Y_len], Z_bytes[Z_len], A_bytes[A_len], B_bytes[B_len];
+    EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, M_bytes, M_len, ctx);
+    EC_POINT_point2oct(us->group, Y, POINT_CONVERSION_COMPRESSED, Y_bytes, Y_len, ctx);
+    EC_POINT_point2oct(us->group, Z, POINT_CONVERSION_COMPRESSED, Z_bytes, Z_len, ctx);
+    EC_POINT_point2oct(us->group, A, POINT_CONVERSION_COMPRESSED, A_bytes, A_len, ctx);
+    EC_POINT_point2oct(us->group, B, POINT_CONVERSION_COMPRESSED, B_bytes, B_len, ctx);
+
+    // --- 5. c = HtoS("secp256k1" || M || Y || Z || A || B) ---
+    const unsigned char domain[] = "secp256k1";
+    size_t h1_len;
+    unsigned char *h1 = concat2(domain, sizeof(domain) - 1, M_bytes, M_len, &h1_len);
+    size_t h2_len;
+    unsigned char *h2 = concat2(h1, h1_len, Y_bytes, Y_len, &h2_len);
+    size_t h3_len;
+    unsigned char *h3 = concat2(h2, h2_len, Z_bytes, Z_len, &h3_len);
+    size_t h4_len;
+    unsigned char *h4 = concat2(h3, h3_len, A_bytes, A_len, &h4_len);
+    size_t h5_len;
+    unsigned char *h5 = concat2(h4, h4_len, B_bytes, B_len, &h5_len);
+
+    BIGNUM *c = BN_new();
+    hash_to_scalar(us, h5, h5_len, c);
+
+    free(h1); free(h2); free(h3); free(h4); free(h5);
+
+    // --- 6. s = (k + c*x) mod q ---
+    BIGNUM *s = BN_new();
+    BIGNUM *tmp = BN_new();
+    BN_mod_mul(tmp, c, x, us->order, ctx);
+    BN_mod_add(s, k, tmp, us->order, ctx);
+
+    // --- 7. 出力フォーマット (A,B,s) 各圧縮点 + s(32byte固定) ---
+    int s_bytes_len = BN_num_bytes(us->order);
+    unsigned char s_bytes[s_bytes_len];
+    BN_bn2binpad(s, s_bytes, s_bytes_len);
+
+    *out_sig_len = A_len + B_len + s_bytes_len;
+    *out_sig = (unsigned char*)malloc(*out_sig_len);
+
+    unsigned char *p = *out_sig;
+    // memcpy(p, Z_bytes, Z_len); p += Z_len;
+    memcpy(p, A_bytes, A_len); p += A_len;
+    memcpy(p, B_bytes, B_len); p += B_len;
+    memcpy(p, s_bytes, s_bytes_len);
+    // print_hex("US NIZK Signature:", *out_sig, *out_sig_len);
+
+    // --- 後始末 ---
+    BN_free(m_scalar); BN_free(k); BN_free(c); BN_free(s); BN_free(tmp);
+    EC_POINT_free(M); EC_POINT_free(Z); EC_POINT_free(A); EC_POINT_free(B);
+    return 1;
+}
+
+int US_NIZK_Verify(US_CTX *us, EC_POINT *Y, unsigned char *message, size_t message_len, unsigned char *sig, size_t sig_len, unsigned char *nizk_sig, size_t nizk_sig_len) {
+    BN_CTX *ctx = us->ctx;
+    const EC_POINT *G = EC_GROUP_get0_generator(us->group);
+
+    // --- 1. message -> M = hash_to_scalar * G ---
+    BIGNUM *m_scalar = BN_new();
+    hash_to_scalar(us, message, message_len, m_scalar);
+    EC_POINT *M = EC_POINT_new(us->group);
+    EC_POINT_mul(us->group, M, NULL, G, m_scalar, ctx);
+    
+    // --- 2. Z を復元 ---
+    EC_POINT *Z = EC_POINT_new(us->group);
+    if (!EC_POINT_oct2point(us->group, Z, sig, sig_len, us->ctx)) {
+        fprintf(stderr, "Error: Failed to restore EC point from compressed signature.\n");
+        return 1;
+    } 
+
+    // --- 3. in_sig の分解 ---
+    // secp256k1 圧縮点は33バイト固定
+    int point_len = 33;
+    // unsigned char *Z_bytes = in_sig;
+    unsigned char *A_bytes = nizk_sig;
+    unsigned char *B_bytes = nizk_sig + point_len;
+    unsigned char *s_bytes = nizk_sig + 2 * point_len;
+    size_t s_len = nizk_sig_len - 2 * point_len; //32
+
+    EC_POINT *A = EC_POINT_new(us->group);
+    EC_POINT *B = EC_POINT_new(us->group);
+    EC_POINT_oct2point(us->group, A, A_bytes, point_len, ctx);
+    EC_POINT_oct2point(us->group, B, B_bytes, point_len, ctx);
+
+    BIGNUM *s = BN_bin2bn(s_bytes, s_len, NULL);
+
+    
+    // --- 4. 再チャレンジ計算 ---
+    size_t M_len = EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+    size_t Y_len = EC_POINT_point2oct(us->group, Y, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+    size_t Z_len = EC_POINT_point2oct(us->group, Z, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+    size_t A_len = EC_POINT_point2oct(us->group, A, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+    size_t B_len = EC_POINT_point2oct(us->group, B, POINT_CONVERSION_COMPRESSED, NULL, 0, ctx);
+    
+    unsigned char M_bytes[M_len], Y_bytes[Y_len], Z_bytes2[Z_len], A_bytes2[A_len], B_bytes2[B_len];
+    EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, M_bytes, M_len, ctx);
+    EC_POINT_point2oct(us->group, Y, POINT_CONVERSION_COMPRESSED, Y_bytes, Y_len, ctx);
+    EC_POINT_point2oct(us->group, Z, POINT_CONVERSION_COMPRESSED, Z_bytes2, Z_len, ctx);
+    EC_POINT_point2oct(us->group, A, POINT_CONVERSION_COMPRESSED, A_bytes2, A_len, ctx);
+    EC_POINT_point2oct(us->group, B, POINT_CONVERSION_COMPRESSED, B_bytes2, B_len, ctx);
+    
+    const unsigned char domain[] = "secp256k1";
+    size_t h1_len;
+    unsigned char *h1 = concat2(domain, sizeof(domain) - 1, M_bytes, M_len, &h1_len);
+    size_t h2_len;
+    unsigned char *h2 = concat2(h1, h1_len, Y_bytes, Y_len, &h2_len);
+    size_t h3_len;
+    unsigned char *h3 = concat2(h2, h2_len, Z_bytes2, Z_len, &h3_len);
+    size_t h4_len;
+    unsigned char *h4 = concat2(h3, h3_len, A_bytes2, A_len, &h4_len);
+    size_t h5_len;
+    unsigned char *h5 = concat2(h4, h4_len, B_bytes2, B_len, &h5_len);
+    
+    BIGNUM *c = BN_new();
+    hash_to_scalar(us, h5, h5_len, c);
+    free(h1); free(h2); free(h3); free(h4); free(h5);
+
+    // --- 5. sG ?= A + cY, sM ?= B + cZ ---
+    EC_POINT *lhs1 = EC_POINT_new(us->group);
+    EC_POINT *rhs1 = EC_POINT_new(us->group);
+    EC_POINT *tmp = EC_POINT_new(us->group);
+    EC_POINT_mul(us->group, lhs1, NULL, G, s, ctx);
+    EC_POINT_mul(us->group, tmp, NULL, Y, c, ctx);
+    EC_POINT_add(us->group, rhs1, A, tmp, ctx);
+    
+    EC_POINT *lhs2 = EC_POINT_new(us->group);
+    EC_POINT *rhs2 = EC_POINT_new(us->group);
+    EC_POINT_mul(us->group, lhs2, NULL, M, s, ctx);
+    EC_POINT_mul(us->group, tmp, NULL, Z, c, ctx);
+    EC_POINT_add(us->group, rhs2, B, tmp, ctx);
+
+    int ok1 = EC_POINT_cmp(us->group, lhs1, rhs1, ctx);
+    int ok2 = EC_POINT_cmp(us->group, lhs2, rhs2, ctx);
+    // printf("ok1=%d, ok2=%d\n", ok1, ok2);
+    // if (ok1 != 0 || ok2 != 0) {
+    //     printf("Verification failed.\n");
+    // } else {
+        //     printf("Verification succeeded.\n");
+    // }
+    BN_free(m_scalar); BN_free(c); BN_free(s);
+    EC_POINT_free(M); EC_POINT_free(Z); EC_POINT_free(A); EC_POINT_free(B);
+    EC_POINT_free(lhs1); EC_POINT_free(rhs1); EC_POINT_free(lhs2); EC_POINT_free(rhs2); EC_POINT_free(tmp);
+
+    return (ok1 == 0 && ok2 == 0) ? 1 : 0;
 }
 
 int save_us_x_pem(BIGNUM *x, const char *filename) {

@@ -236,7 +236,7 @@ int main() {
         return -1;
     }
 
-    // print_hex("R received peer_pub", pkt.p.peer_pub, PUB_LEN);
+    // // print_hex("R received peer_pub", pkt.p.peer_pub, PUB_LEN);
     //　グループ署名の検証
     groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));
     size_t sig_len = pkt.p.sig_len;
@@ -265,6 +265,7 @@ int main() {
     printf("\n===============================復路=================================");
     // レシーバRの処理
     printf("\n=== Node R(R%d) ===\n", NODES - 1);
+    US_CTX *us = US_init("secp256k1");
     
     // ここでsidに紐づけてpi_concatを保存
     
@@ -273,6 +274,7 @@ int main() {
     pkt.h.status = SETUP_RESP;
     pkt.h.idx--;
     pkt.h.idx--; // pi_concatサイズ計算のため加算しすぎたidxをもどす
+    int preid = pkt.h.idx;
     
     // ρ_sを生成
     size_t rho_len = SIG_LEN;
@@ -291,6 +293,37 @@ int main() {
     get_raw_pub(me->dh_sk, kR_pub);
     memcpy(pkt.p.peer_pub, kR_pub, PUB_LEN);
     memcpy(pkt.p.rand_val, me->rand_val, sizeof(me->rand_val));
+
+    // US＿NIZK_Sign で A,B,s を生成
+    size_t nt_len = SIG_LEN, g2_len, nizp_len, nizk_sig_len;
+    unsigned char nt[SIG_LEN];
+    unsigned char *nizp = NULL;
+    unsigned char *nizk_sig = NULL;
+    unsigned char *g2 = concat2(sid, SID_LEN, nodes[preid].addr, 4, &g2_len);
+    // print_hex("g", g2, g2_len);
+    sign_data(me->sk, g2, g2_len, nt, &nt_len);// 本来のτ_Rは state から取得
+    // print_hex("nt", nt, nt_len);
+    nizp = concat2(nt, nt_len, me->rand_val, sizeof(me->rand_val), &nizp_len);// 本来の乱数は state から取得
+    // print_hex("nizp", nizp, nizp_len);
+    // π_i を取り出す
+    size_t offset_cur = preid * USIG_LEN;
+    if (offset_cur + USIG_LEN > MAX_PI) { 
+        fprintf(stderr,"pi_concat out of range\n"); 
+        return -1; 
+    }
+    unsigned char *pi_cur = pkt.h.pi_concat + offset_cur;
+    // print_hex("pi_cur", pi_cur, USIG_LEN);
+    int ver = US_NIZK_Sign(us, nizp, nizp_len, me->us_x, me->us_y, pi_cur, USIG_LEN, &nizk_sig, &nizk_sig_len);
+    if (!ver) { fprintf(stderr,"US_NIZK_Sign error at R%d\n", idx); return 1; }
+    pkt.p.nizk_sig_len = nizk_sig_len;
+    // printf("nizk_sig_len: %zu\n", nizk_sig_len);
+    pkt.p.nizk_sig = (unsigned char *)malloc(nizk_sig_len);
+    memcpy(pkt.p.nizk_sig, nizk_sig, nizk_sig_len);
+    // print_hex("nizk_sig", nizk_sig, nizk_sig_len);
+    free(nizp);
+    free(nizk_sig);
+    free(g2);
+
 
     // ==== SETUP_RESP をパケットに積む（DST_S と pi_concat を格納）====
     // 復路の送信フレームを作成

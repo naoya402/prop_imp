@@ -386,28 +386,12 @@ int main(void) {
         size_t n_len;
         unsigned char *n = concat2(tau, SIG_LEN, rand_val, sizeof(rand_val), &n_len);
         // print_hex("n", n, n_len);
-        const EC_POINT *G = EC_GROUP_get0_generator(us->group);
-        BIGNUM *m_scalar = BN_new();
-        if (!hash_to_scalar(us, n, n_len, m_scalar)) {
-            fprintf(stderr,"hash_to_scalar error\n"); return 1;
-        }
-        EC_POINT *M = EC_POINT_new(us->group);
-        if (!EC_POINT_mul(us->group, M, NULL, G, m_scalar, us->ctx)) {
-            fprintf(stderr,"M mul error\n"); return 1;
-        }
-        // size_t M_len = EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, NULL, 0, us->ctx);
-        // unsigned char M_bytes[M_len];
-        // if (!EC_POINT_point2oct(us->group, M, POINT_CONVERSION_COMPRESSED, M_bytes, M_len, us->ctx)) {
-        //     fprintf(stderr, "EC_POINT_point2oct(M) failed\n");
-        //     return -1;
-        // }
-        // print_hex("M", M_bytes, M_len);
         EC_POINT *R = EC_POINT_new(us->group);
         if (!EC_POINT_oct2point(us->group, R, R_bytes, R_len, us->ctx)) {
             fprintf(stderr, "EC_POINT_oct2point(R) failed\n");
             return -1;
         }
-        int ver = US_verify(us, R, M, a, b);
+        int ver = US_verify(us, R, n, n_len, a, b);
         if (ver == 1) {
             printf("Verify π%d success(US confirmed) \n", cur_id);
         } else {

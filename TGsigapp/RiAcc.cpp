@@ -134,7 +134,7 @@ int main(void) {
     reinq3 = concat2(reinq2, reinq2_len, me->rand_val, sizeof(me->rand_val), &reinq3_len);
     reinq = concat2(reinq3, reinq3_len, (unsigned char*)&flags, 2, &reinq_len);
 
-    // print_hex("[Node] Sending reinq to Verifier: ", reinq3, reinq3_len);
+    // print_hex("[Node] Sending reinq to Verifier: ", reinq, reinq_len);
     uint32_t reinq_len_n = htonl(reinq_len);
     send(client, &reinq_len_n, sizeof(reinq_len_n), 0);
     send(client, reinq, reinq_len, 0);

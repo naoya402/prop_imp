@@ -142,6 +142,10 @@ typedef struct {
     size_t sig_len;
     unsigned char sig_bytes[GSIG_LEN];  // グループ署名
 
+    // ---- SETUP_RESP ----
+    size_t nizk_sig_len;
+    unsigned char *nizk_sig;           // US-NIZK署名
+
     // ---- DATA_TRANS ----
     unsigned char iv[IV_LEN];         // GCM-IV
     size_t ct_len;                    // 暗号文長
@@ -253,7 +257,9 @@ int hash_to_scalar(US_CTX *us, unsigned char *msg, size_t msglen, BIGNUM *out);
 int US_sign(US_CTX *us, unsigned char *message, size_t message_len, BIGNUM *x, unsigned char **sig, size_t *sig_len);
 int US_challenge(US_CTX *us, unsigned char *sig, size_t sig_len, EC_POINT *Y, BIGNUM *a, BIGNUM *b, EC_POINT *W);
 int US_response(US_CTX *us, EC_POINT *W, BIGNUM *x, EC_POINT *R);
-int US_verify(US_CTX *us, EC_POINT *R, EC_POINT *M, BIGNUM *a, BIGNUM *b);
+int US_verify(US_CTX *us, EC_POINT *R, unsigned char *message, size_t message_len, BIGNUM *a, BIGNUM *b);
+int US_NIZK_Sign(US_CTX *us, unsigned char *message, size_t message_len, BIGNUM *x, EC_POINT *Y, unsigned char *sig, size_t sig_len, unsigned char **out_sig, size_t *out_sig_len);
+int US_NIZK_Verify(US_CTX *us, EC_POINT *Y, unsigned char *message, size_t message_len, unsigned char *sig, size_t sig_len, unsigned char *nizk_sig, size_t nizk_sig_len);
 int save_us_x_pem(BIGNUM *x, const char *filename);
 BIGNUM *load_us_x_pem(const char *filename);
 
