@@ -6,9 +6,10 @@
 
 #include "func.h"
 
+#define PORT 9001
+
 // 鍵をファイルから読み込み
-groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme,
-                                   groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
+groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         perror("fopen");
@@ -66,19 +67,52 @@ int main() {
         return 1;
     }
 
-    uint32_t len_n;
-    recv(client_fd, &len_n, sizeof(len_n), 0);
-    uint32_t pkt_len = ntohl(len_n);
+    // uint32_t len_n;
+    // recv(client_fd, &len_n, sizeof(len_n), 0);
+    // uint32_t pkt_len = ntohl(len_n);
 
-    unsigned char frame[pkt_len];
-    recv(client_fd, frame, pkt_len, MSG_WAITALL);
-    close(client_fd);
-    printf("[R1] Received %u bytes from sender\n", pkt_len);
+    // unsigned char frame[pkt_len];
+    // recv(client_fd, frame, pkt_len, MSG_WAITALL);
+    // close(client_fd);
+    // printf("[R1] Received %u bytes from sender\n", pkt_len);
+    /* --- 応答 (暗号化) を受信 --- */
+    uint32_t resp_len_n;
+    if (recv(client_fd, &resp_len_n, sizeof(resp_len_n), 0) != sizeof(resp_len_n)) {
+        perror("recv len");
+        close(client_fd);
+        return 1;
+    }
+    uint32_t resp_len = ntohl(resp_len_n);
+    unsigned char *enc_resp = (unsigned char*)malloc(resp_len);
+    if (!enc_resp) { close(client_fd); return 1; }
+
+    if (recv(client_fd, enc_resp, resp_len, MSG_WAITALL) != (ssize_t)resp_len) {
+        perror("recv body");
+        free(enc_resp);
+        close(client_fd);
+        return 1;
+    }
+    printf("[Sender] Received (encrypted) response (%d bytes)\n", resp_len);
+
+    /* 復号 */
+    unsigned char *dec = NULL;
+    int dec_len = 0;
+    if (tls_decrypt(enc_resp, resp_len, &dec, &dec_len) != 0) {
+        fprintf(stderr, "tls_decrypt failed (response)\n");
+        free(enc_resp);
+        close(client_fd);
+        return 1;
+    }
+    /* dec_len は resp_len の復号後の長さ */
+    printf("[Sender] Decrypted response (%d bytes plaintext)\n", dec_len);
+    free(enc_resp);
     
     // printf("[R1] Received %zu bytes\n", total_read);
     // print_hex("Final frame", frame, pkt_len);
 
     // === パース/処理 ===
+    unsigned char frame[dec_len];
+    memcpy(frame, dec, dec_len);
     if (router_handle_forward(frame, nodes) != 0) {
         fprintf(stderr, "Forward processing failed\n");
         return 1;

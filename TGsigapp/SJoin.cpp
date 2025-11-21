@@ -13,6 +13,8 @@
 #include "groupsig/kty04.h"
 #include "groupsig/message.h"
 
+#include "func.h"
+
 
 #define PORT 9000
 #define SERVER_ADDR "127.0.0.1"
@@ -65,20 +67,20 @@ groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_ke
 //     // groupsig_setup(GROUPSIG_KTY04_CODE, grpkey, mgrkey, gml);
 
 //     char *grpkey_str = groupsig_grp_key_to_string(grpkey); // 確認用
-//     printf("Group Public Key:\n%s\n", grpkey_str);
+//     // printf("Group Public Key:\n%s\n", grpkey_str);
 //     free(grpkey_str);
 //     // int grpkey_size = groupsig_grp_key_get_size(grpkey);
 //     // printf("Group Public Key Size: %d bytes\n", grpkey_size);
     
 //     // --- メンバー鍵作成 ---
-//     printf("11111111\n");
+//     // printf("11111111\n");
 //     groupsig_key_t *memkey = groupsig_mem_key_init(GROUPSIG_KTY04_CODE);
-//     printf("22222222\n");
+//     // printf("22222222\n");
 //     // === Join Step 1: メンバーからマネージャへ送るメッセージを作る ===
 //     message_t *m1 = message_init();
 //     groupsig_join_mem(&m1, memkey, 0, NULL, grpkey);
 //     // message_free(m1);
-//     printf("33333333\n");
+//     // printf("33333333\n");
 
 //     // --- ソケットで送信 ---
 //     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -92,29 +94,74 @@ groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_ke
 //         return 1;
 //     }
 
-//     uint32_t len = htonl(m1->length);
-//     send(sock, &len, sizeof(len), 0);
-//     send(sock, m1->bytes, m1->length, 0);
-//     printf("[Sender] Sent join request (%ld bytes)\n", m1->length);
+//     // uint32_t len = htonl(m1->length);
+//     // send(sock, &len, sizeof(len), 0);
+//     // send(sock, m1->bytes, m1->length, 0);
+//     // printf("[Sender] Sent join request (%ld bytes)\n", m1->length);
+    
+//     /* --- 暗号化して送信 --- */
+//     unsigned char *enc = NULL;
+//     int enc_len = 0;
+//     if (tls_encrypt(m1->bytes, m1->length, &enc, &enc_len) != 0) {
+//         fprintf(stderr, "tls_encrypt failed\n");
+//         close(sock);
+//         return 1;
+//     }
+//     uint32_t enc_len_n = htonl((uint32_t)enc_len);
+//     send(sock, &enc_len_n, sizeof(enc_len_n), 0);
+//     send(sock, enc, enc_len, 0);
+//     printf("[Sender] Sent (encrypted) join request (%d bytes ciphertext + tag)\n", enc_len);
+//     free(enc);
 
-//     // --- 応答 m2 を受信 ---
+//     // // --- 応答 m2 を受信 ---
+//     // uint32_t resp_len_n;
+//     // recv(sock, &resp_len_n, sizeof(resp_len_n), 0);
+//     // uint32_t resp_len = ntohl(resp_len_n);
+
+//     // unsigned char *b = new unsigned char[resp_len];
+//     // recv(sock, b, resp_len, MSG_WAITALL);
+//     // printf("[Sender] Received response (%d bytes)\n", resp_len);
+
+//     /* --- 応答 (暗号化) を受信 --- */
 //     uint32_t resp_len_n;
-//     recv(sock, &resp_len_n, sizeof(resp_len_n), 0);
+//     if (recv(sock, &resp_len_n, sizeof(resp_len_n), 0) != sizeof(resp_len_n)) {
+//         perror("recv len");
+//         close(sock);
+//         return 1;
+//     }
 //     uint32_t resp_len = ntohl(resp_len_n);
+//     unsigned char *enc_resp = (unsigned char*)malloc(resp_len);
+//     if (!enc_resp) { close(sock); return 1; }
 
-//     unsigned char *b = new unsigned char[resp_len];
-//     recv(sock, b, resp_len, MSG_WAITALL);
-//     printf("[Sender] Received response (%d bytes)\n", resp_len);
+//     if (recv(sock, enc_resp, resp_len, MSG_WAITALL) != (ssize_t)resp_len) {
+//         perror("recv body");
+//         free(enc_resp);
+//         close(sock);
+//         return 1;
+//     }
+//     printf("[Sender] Received (encrypted) response (%d bytes)\n", resp_len);
 
+//     /* 復号 */
+//     unsigned char *dec = NULL;
+//     int dec_len = 0;
+//     if (tls_decrypt(enc_resp, resp_len, &dec, &dec_len) != 0) {
+//         fprintf(stderr, "tls_decrypt failed (response)\n");
+//         free(enc_resp);
+//         close(sock);
+//         return 1;
+//     }
+//     /* dec_len は resp_len の復号後の長さ */
+//     printf("[Sender] Decrypted response (%d bytes plaintext)\n", dec_len);
+//     free(enc_resp);
+//     // free(dec);
 //     close(sock);
 
 //     // === Join Step 2: 最終メンバー鍵を完成させる ===
-//     groupsig_key_t *final_memkey = groupsig_mem_key_import(GROUPSIG_KTY04_CODE, b, resp_len);
+//     groupsig_key_t *final_memkey = groupsig_mem_key_import(GROUPSIG_KTY04_CODE, dec, dec_len);
 //     char *memkey_str = groupsig_mem_key_to_string(final_memkey);
 //     printf("Final Membership Key:\n%s\n", memkey_str);
 //     free(memkey_str);
-//     // Revealされたらこのfinal_memkeyで署名しても識別される
-//     // std::cout << "[Sender] Membership key imported successfully.\n";
+//     // Revealされたら以降このfinal_memkeyでグループ署名しても識別(Trace)される
 
 //     // 最終の鍵を保存
 //     byte_t *mem_bytes = NULL;
@@ -128,7 +175,7 @@ groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_ke
 
 //     free(mem_bytes);
 
-//     delete[] b;
+//     // delete[] b;
 //     message_free(m1);
 //     groupsig_mem_key_free(final_memkey);
 //     groupsig_mem_key_free(memkey);
@@ -138,7 +185,7 @@ groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_ke
 // }
 
 
-// // 事前の鍵準備コード
+// // 事前の鍵準備コード(Setup)
 // int main() {
 //     groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));
 
@@ -262,8 +309,14 @@ int main(void) {
     rc = groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));
     CHECK_RC(rc, "groupsig_init");
 
-    groupsig_key_t *grpkey = groupsig_grp_key_init(GROUPSIG_KTY04_CODE);//load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);//groupsig_grp_key_init(GROUPSIG_KTY04_CODE);
-    groupsig_key_t *mgrkey = groupsig_mgr_key_init(GROUPSIG_KTY04_CODE);//load_key_from_file("mgrkey.pem", GROUPSIG_KTY04_CODE, groupsig_mgr_key_import);//groupsig_mgr_key_init(GROUPSIG_KTY04_CODE);
+    groupsig_key_t *grpkey = groupsig_grp_key_init(GROUPSIG_KTY04_CODE);
+    groupsig_key_t *mgrkey = groupsig_mgr_key_init(GROUPSIG_KTY04_CODE);
+    // char *cstr = groupsig_grp_key_to_string(grpkey);
+    // printf("grpkey: %s\n", cstr);
+    // free(cstr);
+    // char *mgrkstr = groupsig_mgr_key_to_string(mgrkey);
+    // printf("Loaded Manager Key:\n%s\n", mgrkstr);
+    // free(mgrkstr);
     gml_t *gml = gml_init(GROUPSIG_KTY04_CODE);
     crl_t *crl = crl_init(GROUPSIG_KTY04_CODE);
     if (!grpkey || !mgrkey || !gml || !crl) {
@@ -337,7 +390,7 @@ int main(void) {
     
     // If valid != 1, print diagnostics
     if (valid != 1) {
-        fprintf(stderr, "VERIFY FAILED: valid=%d\n", valid);
+        fprintf(stderr, "VERIFY FAILED\n");
         // print more info: sizes of grpkey, memkey, etc.
         // printf("grpkey get size: %d\n", groupsig_grp_key_get_size(grpkey));
         // printf("memkey get size: %d\n", groupsig_mem_key_get_size(final_memkey));
@@ -388,7 +441,7 @@ int main(void) {
     message_free(msg);
     gml_free(gml);
     groupsig_grp_key_free(grpkey);
-    groupsig_mgr_key_free(mgrkey);
+    // groupsig_mgr_key_free(mgrkey);
     groupsig_clear(GROUPSIG_KTY04_CODE);
 
     return 0;

@@ -5,6 +5,9 @@
 
 #include "func.h"
 
+#define PORT 9001
+#define SERVER_ADDR "127.0.0.1"
+
 // 鍵をファイルから読み込み
 groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_key_t *(*import_func)(uint8_t, byte_t *, uint32_t)) {
     FILE *f = fopen(path, "rb");
@@ -161,10 +164,23 @@ int main(void) {
         return 1;
     }
 
-    uint32_t len_n = htonl(total_len);
-    send(sock, &len_n, sizeof(len_n), 0);
-    send(sock, frame, total_len, 0);
-    printf("S sent SETUP_REQ (%zu bytes)\n", total_len);
+    // uint32_t len_n = htonl(total_len);
+    // send(sock, &len_n, sizeof(len_n), 0);
+    // send(sock, frame, total_len, 0);
+    // printf("S sent SETUP_REQ (%zu bytes)\n", total_len);
+    /* --- 暗号化して送信 --- */
+    unsigned char *enc = NULL;
+    int enc_len = 0;
+    if (tls_encrypt(frame, total_len, &enc, &enc_len) != 0) {
+        fprintf(stderr, "tls_encrypt failed\n");
+        close(sock);
+        return 1;
+    }
+    uint32_t enc_len_n = htonl((uint32_t)enc_len);
+    send(sock, &enc_len_n, sizeof(enc_len_n), 0);
+    send(sock, enc, enc_len, 0);
+    printf("[Sender] Sent (encrypted) join request (%d bytes ciphertext + tag)\n", enc_len);
+    free(enc);
 
     close(sock);
 

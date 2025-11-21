@@ -25,17 +25,17 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif
-
+    #endif
+    
 // #include "groupsig/groupsig.h"
 // #include "groupsig/gml.h"
 // #include "groupsig/kty04.h"
 // #include "groupsig/message.h"
 
 
-#define PORT 9001
+// #define PORT 9001
 #define MAX_FRAME 4096
-#define SERVER_ADDR "127.0.0.1"
+// #define SERVER_ADDR "127.0.0.1"
 
 #define ROUTERS 4
 #define NODES   (ROUTERS+2)
@@ -60,6 +60,8 @@ extern "C" {
 #define MAX_PTXT 1024
 #define MAX_PKT  4096
 #define MAX_STATE  8
+#define PAD_LEN 32
+#define AESGCM_TAGLEN 16
 
 #define CURVE_NID NID_secp256k1
 
@@ -80,6 +82,12 @@ extern const char *router_addresses[];
 extern EVP_MD_CTX *mdctx1, *mdctx2;
 extern const char *policy[];
 extern const int POLICY_COUNT;
+// 固定IV (テスト用 簡易実装)
+extern const uint8_t fixed_tls_iv[12];
+extern const uint8_t fixed_tls_key[32];
+extern uint32_t nonce_counter;
+
+
 
 
 // ========= L2/L3 (Ether/IPv4) ヘッダ =========
@@ -114,14 +122,20 @@ typedef struct {
 
     // SETUP_REQ
     unsigned char seg_concat[MAX_SEG_CON];         // 暗号化経路情報リストデータ
+
+    unsigned char com_concat[MAX_PI];          // コミットメントリストデータ
+
     // SETUP_REQ / SETUP_RESP ヘッダ: πリスト情報
     unsigned char pi_concat[MAX_PI];         // π リストデータ
+
+    unsigned char dh_pk_concat[ROUTERS * PUB_LEN]; // DH公開鍵リストデータ
 
     // SETUP_RESP ヘッダ: ρ
     unsigned char rho[2][SIG_LEN];             // ρ データ
 
     // DATA_TRANS ヘッダ: アカウンタビリティセグメント
-    unsigned char acseg_concat[ACSEG_LEN];       // アカウンタビリティセグメント
+    // size_t acseg_concat_len;
+    unsigned char acseg_concat[MAX_PTXT];       // アカウンタビリティセグメント
 
 } Oheader;
 
@@ -131,20 +145,19 @@ typedef struct {
     // SETUP_REQ
     // uint16_t tau_len;
     unsigned char tau[SIG_LEN];       //検証用の署名
+    unsigned char v[162];   //πのNIZK用の値
+    size_t sig_len;
+    unsigned char sig_bytes[GSIG_LEN];  // グループ署名
     
     // SETUP_RESP
     unsigned char rand_val[4];        //検証用の乱数
+    size_t nizk_sig_len;
+    unsigned char *nizk_sig;           // US-NIZK署名
     
     // ---- SETUP_REQ / SETUP_RESP ----
     unsigned char peer_pub[PUB_LEN];  // 公開鍵 (k_C または k_S)
 
-    // ---- SETUP_REQ ----
-    size_t sig_len;
-    unsigned char sig_bytes[GSIG_LEN];  // グループ署名
 
-    // ---- SETUP_RESP ----
-    size_t nizk_sig_len;
-    unsigned char *nizk_sig;           // US-NIZK署名
 
     // ---- DATA_TRANS ----
     unsigned char iv[IV_LEN];         // GCM-IV
@@ -162,9 +175,8 @@ typedef struct {
     int id; // ノードID (今回は便宜上0=センダー, NODES-1=レシーバ)
     // char name[8];
     unsigned char addr[4];
-    unsigned char rand_val[4];
-
-
+    
+    
     // X25519 (DH)
     EVP_PKEY *dh_sk;
     EVP_PKEY *dh_pk;
@@ -178,13 +190,14 @@ typedef struct {
     EC_POINT *us_y; // 公開鍵
 
     // セッション鍵
-    //センダーは全ノード分(k)、レシーバは自ノード分のみ(ki)
+    //センダー,レシーバは全ノード分(k)、自ノード分のみ(ki)
     unsigned char k[NODES][KEY_LEN];//各ノードとの共有鍵
     unsigned char ki[KEY_LEN];//センダーと自ノードとの共有鍵
-
+    unsigned char ki_R[KEY_LEN];//レシーバと自ノードとの共有鍵
+    
     unsigned char sess_key[KEY_LEN];
     int has_sess;
-
+    
     // SIDに紐づく前後ホップ状態
     struct {
         int used;
@@ -196,6 +209,7 @@ typedef struct {
         char nnext_addr; //本来アドレスだが便宜上ノードID
         unsigned char tau[SIG_LEN];   // τi
         size_t tau_len;
+        unsigned char rand_val[4];
     } state[MAX_STATE];
 } Node;
 
@@ -259,11 +273,18 @@ int US_challenge(US_CTX *us, unsigned char *sig, size_t sig_len, EC_POINT *Y, BI
 int US_response(US_CTX *us, EC_POINT *W, BIGNUM *x, EC_POINT *R);
 int US_verify(US_CTX *us, EC_POINT *R, unsigned char *message, size_t message_len, BIGNUM *a, BIGNUM *b);
 int US_NIZK_Sign(US_CTX *us, unsigned char *message, size_t message_len, BIGNUM *x, EC_POINT *Y, unsigned char *sig, size_t sig_len, unsigned char **out_sig, size_t *out_sig_len);
-int US_NIZK_Verify(US_CTX *us, EC_POINT *Y, unsigned char *message, size_t message_len, unsigned char *sig, size_t sig_len, unsigned char *nizk_sig, size_t nizk_sig_len);
+// int US_NIZK_Verify(US_CTX *us, EC_POINT *Y, unsigned char *message, size_t message_len, unsigned char *sig, size_t sig_len, unsigned char *nizk_sig, size_t nizk_sig_len);
 int save_us_x_pem(BIGNUM *x, const char *filename);
 BIGNUM *load_us_x_pem(const char *filename);
-
-
+void build_nonce(uint8_t *nonce_out, uint32_t counter);
+int tls_encrypt(const unsigned char *pt, int pt_len, unsigned char **out, int *out_len);
+int tls_decrypt(const unsigned char *in, int in_len, unsigned char **out_pt, int *out_pt_len);
+int US_NIZK_Confirm(US_CTX *us, unsigned char *message, size_t message_len,  BIGNUM *xA, EC_POINT *YB, unsigned char *sig, size_t sig_len, unsigned char **confirm_msg, size_t *confirm_len);
+int US_NIZK_VerifyC(US_CTX *us, EC_POINT *YA, EC_POINT *YB, unsigned char *message, size_t message_len, unsigned char *sig, size_t sig_len, unsigned char *confirm_msg, size_t confirm_len);
+int US_NIZK_Disavow(US_CTX *us, unsigned char *message, size_t message_len, BIGNUM *xA, EC_POINT *YB, unsigned char *sig, size_t sig_len, unsigned char **disavow_msg, size_t *disavow_len);
+int US_NIZK_VerifyD(US_CTX *us, EC_POINT *YA, EC_POINT *YB, unsigned char *message, size_t message_len, unsigned char *sig, size_t sig_len, unsigned char *disavow_msg, size_t disavow_len);
+int EC_Commit(US_CTX *us, const unsigned char *s_bytes, size_t s_len, const unsigned char *t_bytes, size_t t_len, const EC_POINT *H, unsigned char **out_commit, size_t *out_commit_len);
+int EC_Com_Verify(US_CTX *us, const unsigned char *s_bytes, size_t s_len, const unsigned char *t_bytes, size_t t_len, const EC_POINT *H, const unsigned char *commit, size_t commit_len);
 
 #ifdef __cplusplus
 }

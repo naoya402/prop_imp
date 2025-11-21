@@ -69,25 +69,88 @@ int main(void) {
         fprintf(stderr,"US_response error\n"); return 1;
     }
 
-    // Bob verifies
-    int ver = US_verify(us, R, message, strlen((const char*)message), a, b);
-    if (ver == 1) {
-        printf("Signature CONFIRMED.\n");
-    } else if (ver == 0) {
-        printf("Signature NOT confirmed.\n");
-    }
+    // // Bob verifies
+    // int ver = US_verify(us, R, message, strlen((const char*)message), a, b);
+    // if (ver == 1) {
+    //     printf("Signature CONFIRMED.\n");
+    // } else if (ver == 0) {
+    //     printf("Signature NOT confirmed.\n");
+    // }
 
-    size_t sigma_len; // sufficient size
-    unsigned char *sigma = NULL;
-    ver  = US_NIZK_Sign(us, message, strlen((const char*)message), x, Y, buf, buf_len, &sigma, &sigma_len);
-    if (!ver) { fprintf(stderr,"US_NIZK_Sign error\n"); return 1; }
+    size_t v_len; // sufficient size
+    unsigned char *v = NULL;
 
-    ver = US_NIZK_Verify(us, Y, message, strlen((const char*)message), buf, buf_len, sigma, sigma_len);
+    int ver = US_NIZK_Confirm(us, message, strlen((const char*)message), x, Y, buf, buf_len, &v, &v_len);
+    if (!ver) { fprintf(stderr,"US_NIZK_Confirm error\n"); return 1; }
+
+    // print_hex("NIZK Confirmation Message:", v, v_len);
+    
+    ver = US_NIZK_VerifyC(us, Y, Y, message, strlen((const char*)message), buf, buf_len, v, v_len);
     if (ver == 1) {
         printf("NIZK Signature CONFIRMED.\n");
     } else if (ver == 0) {
         printf("NIZK Signature NOT confirmed.\n");
     }
+
+    BIGNUM *x2 = BN_new();
+    if (!BN_rand_range(x2, us->order)) { fprintf(stderr,"BN_rand_range error\n"); return 1; }
+    EC_POINT *Y2 = EC_POINT_new(us->group);
+    if (!EC_POINT_mul(us->group, Y2, NULL, G, x2, us->ctx)) { fprintf(stderr,"pubkey mul error\n"); return 1; }
+    size_t buf2_len;
+    unsigned char *buf2 = NULL;
+    unsigned char* message2 = (unsigned char *)"h";//argv[1];
+    US_sign(us,message2, strlen((const char*)message2), x2, &buf2, &buf2_len);
+    // generate private key x and public key Y = x*G
+
+    size_t v2_len; // sufficient size
+    unsigned char *v2 = NULL;
+    ver = US_NIZK_Disavow(us, message, strlen((const char*)message), x, Y, buf, buf_len, &v2, &v2_len);
+    if (!ver) { fprintf(stderr,"US_NIZK_Confirm error\n"); return 1; }
+    
+    // print_hex("NIZK Confirmation Message:", v2, v2_len);
+    
+    ver = US_NIZK_VerifyD(us, Y, Y, message, strlen((const char*)message), buf, buf_len, v2, v2_len);
+    if (ver == 1) {
+        printf("NIZK Signature DISAVOWED.\n");
+    } else if (ver == 0) {
+        printf("NIZK Signature NOT disavowed.\n"); //こっちが正しい
+    }
+
+    ver = US_NIZK_Disavow(us, message2, strlen((const char*)message2), x, Y, buf2, buf2_len, &v2, &v2_len);
+    if (!ver) { fprintf(stderr,"US_NIZK_Confirm error\n"); return 1; }
+    
+    // print_hex("NIZK Confirmation Message:", v2, v2_len);
+    
+    ver = US_NIZK_VerifyD(us, Y, Y, message2, strlen((const char*)message2), buf2, buf2_len, v2, v2_len);
+    if (ver == 1) {
+        printf("NIZK Signature DISAVOWED.\n");//こっちが正しい
+    } else if (ver == 0) {
+        printf("NIZK Signature NOT disavowed.\n");
+    }
+
+    // ------------- EC Commitment -------------
+    unsigned char *commit = NULL;
+    size_t commit_len = 0;
+    ver = EC_Commit(us, message, strlen((const char*)message), (unsigned char *)"randomness", strlen("randomness"), G, &commit, &commit_len);
+    if (!ver) { fprintf(stderr,"EC_Commit error\n"); return 1; }
+    // print_hex("EC Commitment:", commit, commit_len);
+
+    ver = EC_Com_Verify(us, message, strlen((const char*)message), (unsigned char *)"randomness", strlen("randomness"), G, commit, commit_len);
+    if (ver == 1) {
+        printf("EC Commitment VERIFIED.\n");
+    } else if (ver == 0) {
+        printf("EC Commitment NOT verified.\n");
+    }
+
+    // ver  = US_NIZK_Sign(us, message, strlen((const char*)message), x, Y, buf, buf_len, &sigma, &sigma_len);
+    // if (!ver) { fprintf(stderr,"US_NIZK_Sign error\n"); return 1; }
+
+    // ver = US_NIZK_Verify(us, Y, message, strlen((const char*)message), buf, buf_len, sigma, sigma_len);
+    // if (ver == 1) {
+    //     printf("NIZK Signature CONFIRMED.\n");
+    // } else if (ver == 0) {
+    //     printf("NIZK Signature NOT confirmed.\n");
+    // }
 
     free(buf);
     return 0;

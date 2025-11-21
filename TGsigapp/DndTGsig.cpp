@@ -971,7 +971,7 @@ int main(void) {
     unsigned char kR_pub[PUB_LEN];
     get_raw_pub(me->dh_sk, kR_pub);
     memcpy(pkt.p.peer_pub, kR_pub, PUB_LEN);
-    memcpy(pkt.p.rand_val, me->rand_val, sizeof(me->rand_val));
+    memcpy(pkt.p.rand_val, me->state[0].rand_val, sizeof(me->state[0].rand_val));
 
     // ==== SETUP_RESP をパケットに積む（DST_S と pi_concat を格納）====
     // 復路の送信フレームを作成
