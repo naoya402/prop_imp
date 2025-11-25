@@ -432,6 +432,8 @@ size_t build_overlay_setup_req(unsigned char *l2, size_t cap, const Packet *pkt)
     // ぺイロード
     memcpy(p, pkt->p.tau, SIG_LEN); p += SIG_LEN; //固定長で送る
     // print_hex("pkt.p.tau", pkt->p.tau, SIG_LEN);
+    memcpy(p, pkt->p.v, 162); p += 162; //固定長で送る
+    // print_hex("pkt.p.v", pkt->p.v, 162);
     memcpy(p, pkt->p.peer_pub, PUB_LEN); p += PUB_LEN;
     // print_hex("pkt.p.peer_pub", pkt->p.peer_pub, PUB_LEN);
     // print_hex("Built SETUP_REQ", l2 + off, (size_t)(p - l2 - off));
@@ -486,15 +488,15 @@ size_t build_overlay_data_trans(unsigned char *l2, size_t cap, const Packet *pkt
     // print_hex( "pkt.h.cid", pkt->h.cid, CID_LEN);
     memcpy(p, &pkt->h.cid, CID_LEN); p += CID_LEN;
     *p++ = pkt->h.status;
-    *p++ = pkt->h.idx;
+    *p++ = pkt->h.idx;//66
     
-    // uint32_t ac_len = htons(pkt->h.acseg_concat_len); memcpy(p, &ac_len, sizeof(ac_len)); p += sizeof(ac_len);
-    memcpy(p, pkt->h.acseg_concat, (pkt->h.idx - 1) * ACSEG_LEN); p += (pkt->h.idx - 1) * ACSEG_LEN;
+    memcpy(p, pkt->h.acseg_concat, ROUTERS * ACSEG_LEN); p += ROUTERS * ACSEG_LEN;//128
     // ぺイロード
     memcpy(p, pkt->p.iv, IV_LEN); p += IV_LEN;
     uint16_t n = htons(ctlen); memcpy(p, &n, 2); p += 2;
+    // printf("ctlen: %d\n", ctlen);
     memcpy(p, pkt->p.ct, ctlen); p += ctlen;
-    memcpy(p, pkt->p.tag, TAG_LEN); p += TAG_LEN;
+    memcpy(p, pkt->p.tag, TAG_LEN); p += TAG_LEN;//41 +32(padding)
     return (size_t)(p - l2 - off);
 }
 
@@ -550,6 +552,9 @@ int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt
         if (p + SIG_LEN > buf + len) return -1;
         memcpy(pkt->p.tau, p, SIG_LEN); p += SIG_LEN;
         // print_hex("pkt.p.tau", pkt->p.tau, SIG_LEN);
+        if (p + 162 > buf + len) return -1;
+        memcpy(pkt->p.v, p, 162); p += 162;
+        // print_hex("pkt.p.v", pkt->p.v, 162);
         if (p + PUB_LEN > buf + len) return -1;
         memcpy(pkt->p.peer_pub, p, PUB_LEN); p += PUB_LEN;
         // print_hex("pkt.p.peer_pub", pkt->p.peer_pub, PUB_LEN);
@@ -558,6 +563,7 @@ int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt
         memcpy(&sig_len_n, p, sizeof(sig_len_n));
         pkt->p.sig_len = ntohl(sig_len_n);
         p += sizeof(sig_len_n);
+        // printf ("sig_len: %lu\n", pkt->p.sig_len);
         if (p + pkt->p.sig_len > buf + len) return -1;
         memcpy(pkt->p.sig_bytes, p, pkt->p.sig_len); p += pkt->p.sig_len;
         // print_hex("pkt.p.sig_bytes", pkt->p.sig_bytes, pkt->p.sig_len);
@@ -595,7 +601,7 @@ int parse_frame_to_pkt(const unsigned char *frame, size_t frame_len, Packet *pkt
         // pkt->h.acseg_concat_len = ntohs(*(uint32_t*)&ac_len_n);
         // printf("acseg_concat_len: %lu\n", pkt->h.acseg_concat_len);
         // p += sizeof(ac_len_n);
-        memcpy(pkt->h.acseg_concat, p, (pkt->h.idx - 1) * ACSEG_LEN); p += (pkt->h.idx - 1) * ACSEG_LEN;
+        memcpy(pkt->h.acseg_concat, p, ROUTERS * ACSEG_LEN); p += ROUTERS * ACSEG_LEN;
         // payload: IV + CT_LEN + CT + TAG
         if (p + IV_LEN > buf + len) return -1;
         memcpy(pkt->p.iv, p, IV_LEN); p += IV_LEN;
@@ -786,7 +792,7 @@ int router_handle_forward(unsigned char *frame, Node *nodes) {
     size_t n_len, nn_len, n2_len, nn2_len; //π用
     // size_t cm_len; //コミットメント用
     size_t v_len; // πのNIZK用
-    unsigned char *m = NULL, *n = NULL, *nn = NULL, *m2 = NULL, *n2 = NULL, *nn2 = NULL, *cm = NULL, *v = NULL;
+    unsigned char *m = NULL, *n = NULL, *nn = NULL, *m2 = NULL, *n2 = NULL, *nn2 = NULL, *v = NULL;
     unsigned char pi[USIG_LEN], tau[SIG_LEN];
     size_t pi_len = USIG_LEN, tau_len = SIG_LEN;
 
@@ -899,7 +905,6 @@ int router_handle_forward(unsigned char *frame, Node *nodes) {
     size_t commit_len = 0;
     int ver = EC_Commit(us, pkt.p.tau, SIG_LEN, me->state[0].rand_val, sizeof(me->state[0].rand_val), G, &commit, &commit_len);
     if (!ver) { fprintf(stderr,"EC_Commit error\n"); return 1; }
-    free(cm);
     size_t offset = (idx - 1) * USIG_LEN;
 
     if (offset + commit_len > sizeof(pkt.h.com_concat)) {
@@ -931,7 +936,7 @@ int router_handle_forward(unsigned char *frame, Node *nodes) {
         return -1;
     }
     memcpy(pkt.h.pi_concat + poffset, USpi, USpi_len);
-    printf("π%d", idx);print_hex(" ", USpi, USpi_len);
+    // printf("π%d", idx);print_hex(" ", USpi, USpi_len);
     // print_hex("pi_concat", pkt.h.pi_concat, MAX_PI);
 
     // 次ホップの検証するvを生成(RもVのために必要)
@@ -1143,24 +1148,40 @@ int router_handle_data_trans(unsigned char *frame, Node *nodes) {
         die("no next hop in data forward");
     }
 
+    // Sからのアカセグ検証
+    unsigned char *acseg = (unsigned char *)malloc(ACSEG_LEN);
+    unsigned int acseg_len;
+    size_t offset = (idx - 1) * ACSEG_LEN;
+    // print_hex("AC Plain", ac_plain2, ac_plain2_len);
+    int hmac_result = hmac_sha256(me->ki, KEY_LEN, pkt.p.ct, pkt.p.ct_len, acseg, &acseg_len);
+    // acseg_concat内の自身のacsegと比較
+    // print_hex("Received ACSEG", pkt.h.acseg_concat + offset, ACSEG_LEN);
+    if (memcmp(acseg, pkt.h.acseg_concat + offset, ACSEG_LEN) == 0) {
+        // printf("R%d ACSEG match\n", idx);
+    } else {
+        printf("R%d ACSEG mismatch\n", idx);
+        return -1;
+    }
+    free(acseg);
+
     //アカウンタビリティセグメントを付加
     // ペイロード部の連結
-    size_t pay_len = IV_LEN + 2 + pkt.p.ct_len + TAG_LEN;
-    unsigned char *pay_buf1; size_t pay_buf1_len;
-    unsigned char *pay_buf2; size_t pay_buf2_len;
-    unsigned char *pay_buf3; size_t pay_buf3_len;
-    uint16_t ctlen_n = htons((uint16_t)pkt.p.ct_len);
+    // size_t pay_len = IV_LEN + 2 + pkt.p.ct_len + TAG_LEN;
+    // unsigned char *pay_buf1; size_t pay_buf1_len;
+    // unsigned char *pay_buf2; size_t pay_buf2_len;
+    // unsigned char *pay_buf3; size_t pay_buf3_len;
+    // uint16_t ctlen_n = htons((uint16_t)pkt.p.ct_len);
     // pay_buf1 = concat2(pkt.p.iv, IV_LEN, (unsigned char*)&ctlen_n, 2, &pay_buf1_len);
     // pay_buf2 = concat2(pay_buf1, pay_buf1_len, pkt.p.ct, pkt.p.ct_len, &pay_buf2_len);
     // pay_buf3 = concat2(pay_buf2, pay_buf2_len, pkt.p.tag, TAG_LEN, &pay_buf3_len);
     // print_hex("Payload for ACSEG: ",pay_buf3, pay_buf3_len);
 
     // SID || Payload || next_addr(4B)
-    size_t ac_plain_len = SID_LEN + pay_buf3_len + 4;
-    unsigned char *ac_plain1; size_t ac_plain1_len;
+    // size_t ac_plain_len = SID_LEN + pay_buf3_len + 4;
+    // unsigned char *ac_plain1; size_t ac_plain1_len;
     unsigned char *ac_plain2; size_t ac_plain2_len;
 
-    uint32_t next_addr_n = htonl((uint32_t)next_addr);
+    // uint32_t next_addr_n = htonl((uint32_t)next_addr);
     // ac_plain1 = concat2(pkt.h.sid, SID_LEN, pay_buf3, pay_buf3_len, &ac_plain1_len);
     // ac_plain2 = concat2(ac_plain1, ac_plain1_len, (unsigned char*)&next_addr_n, 4, &ac_plain2_len);
     // printf("idx=%d\n", idx);
@@ -1169,27 +1190,16 @@ int router_handle_data_trans(unsigned char *frame, Node *nodes) {
     // print_hex("AC_PLAIN: ", ac_plain2, ac_plain2_len);
 
     // HMACでACSEG生成
-    unsigned char acseg[ACSEG_LEN];
-    unsigned int acseg_len;
+    // unsigned char acseg[ACSEG_LEN];
+    // unsigned int acseg_len;
     // print_hex("me->ki", me->ki, KEY_LEN);
-    int hmac_result = hmac_sha256(me->ki, KEY_LEN, ac_plain2, ac_plain2_len, acseg, &acseg_len);
-    if (hmac_result != 0) {
+    int hmac_result2 = hmac_sha256(me->ki_R, KEY_LEN, ac_plain2, ac_plain2_len, pkt.h.acseg_concat + offset, &acseg_len);
+    if (hmac_result2 != 0) {
         fprintf(stderr,"HMAC failed at R%d\n", idx);
         return -1;
     }
-    // printf("R%d ACSEG: ", idx); 
-    // print_hex("", acseg, acseg_len);
-
-    size_t offset = (idx - 1) * ACSEG_LEN;
-
-    // if (offset + acseg_len > ROUTERS * ACSEG_LEN) {
-    //     fprintf(stderr,"acseg_concat overflow\n");
-    //     // OPENSSL_free(pi);
-    //     return -1;
-    // }
-    memcpy(pkt.h.acseg_concat + offset, acseg, acseg_len);
-    // pkt.h.acseg_concat_len += acseg_len;//長さを更新
-    // print_hex("ACSEG", pkt.h.acseg_concat, pkt.h.acseg_concat_len);
+    // printf("R%d ACSEG: ", idx); print_hex("", pkt.h.acseg_concat + offset, acseg_len);
+    // print_hex("ACSEG", pkt.h.acseg_concat, ROUTERS * ACSEG_LEN);
 
     // ctのハッシュ値を計算
     unsigned char ct_hash[SHA256_DIGEST_LENGTH];

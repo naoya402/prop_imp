@@ -116,24 +116,24 @@ int main() {
     // === Join Step 2: マネージャ応答 ===
     groupsig_join_mgr(&m2, gml, mgrkey, 1, m1, grpkey);
 
-    // // --- m2 を送信 ---
-    // uint32_t resp_len_n = htonl(m2->length);
-    // send(client_sock, &resp_len_n, sizeof(resp_len_n), 0);
-    // send(client_sock, m2->bytes, m2->length, 0);
-    // printf("[Verifier] Sent m2 (%ld bytes)\n", m2->length);
-    /* 暗号化して送信 */
-    unsigned char *enc_m2 = NULL;
-    int enc_m2_len = 0;
-    if (tls_encrypt(m2->bytes, m2->length, &enc_m2, &enc_m2_len) != 0) {
-        fprintf(stderr, "tls_encrypt failed (m2)\n");
-        close(client_sock); close(serv_sock);
-        return 1;
-    }
-    uint32_t send_len_n = htonl((uint32_t)enc_m2_len);
-    send(client_sock, &send_len_n, sizeof(send_len_n), 0);
-    send(client_sock, enc_m2, enc_m2_len, 0);
-    printf("[Verifier] Sent (encrypted) m2 (%d bytes ciphertext+tag)\n", enc_m2_len);
-    free(enc_m2);
+    // --- m2 を送信 ---
+    uint32_t resp_len_n = htonl(m2->length);
+    send(client_sock, &resp_len_n, sizeof(resp_len_n), 0);
+    send(client_sock, m2->bytes, m2->length, 0);
+    printf("[Verifier] Sent m2 (%ld bytes)\n", m2->length);
+    // /* 暗号化して送信 */
+    // unsigned char *enc_m2 = NULL;
+    // int enc_m2_len = 0;
+    // if (tls_encrypt(m2->bytes, m2->length, &enc_m2, &enc_m2_len) != 0) {
+    //     fprintf(stderr, "tls_encrypt failed (m2)\n");
+    //     close(client_sock); close(serv_sock);
+    //     return 1;
+    // }
+    // uint32_t send_len_n = htonl((uint32_t)enc_m2_len);
+    // send(client_sock, &send_len_n, sizeof(send_len_n), 0);
+    // send(client_sock, enc_m2, enc_m2_len, 0);
+    // printf("[Verifier] Sent (encrypted) m2 (%d bytes ciphertext+tag)\n", enc_m2_len);
+    // free(enc_m2);
 
     close(client_sock);
     close(serv_sock);

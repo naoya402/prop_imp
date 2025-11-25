@@ -34,7 +34,7 @@ extern "C" {
 
 
 // #define PORT 9001
-#define MAX_FRAME 4096
+#define MAX_FRAME 8192
 // #define SERVER_ADDR "127.0.0.1"
 
 #define ROUTERS 4
@@ -53,12 +53,11 @@ extern "C" {
 #define MAX_SEG_CON (ROUTERS + 1) * (SEG_LEN + TAG_LEN + IV_LEN)
 #define SIG_LEN 64
 #define USIG_LEN 33
-#define GSIG_LEN 2040
+#define GSIG_LEN 6100  // グループ署名の最大長 (適宜調整)
 #define MAX_PI ((ROUTERS + 1) * USIG_LEN)
 #define ACSEG_LEN 32
 // #define MAX_ACSEG_CON ROUTERS * ACSEG_LEN
 #define MAX_PTXT 1024
-#define MAX_PKT  4096
 #define MAX_STATE  8
 #define PAD_LEN 32
 #define AESGCM_TAGLEN 16
@@ -122,13 +121,11 @@ typedef struct {
 
     // SETUP_REQ
     unsigned char seg_concat[MAX_SEG_CON];         // 暗号化経路情報リストデータ
-
-    unsigned char com_concat[MAX_PI];          // コミットメントリストデータ
-
+    
     // SETUP_REQ / SETUP_RESP ヘッダ: πリスト情報
-    unsigned char pi_concat[MAX_PI];         // π リストデータ
-
     unsigned char dh_pk_concat[ROUTERS * PUB_LEN]; // DH公開鍵リストデータ
+    unsigned char com_concat[MAX_PI];          // コミットメントリストデータ
+    unsigned char pi_concat[MAX_PI];         // π リストデータ
 
     // SETUP_RESP ヘッダ: ρ
     unsigned char rho[2][SIG_LEN];             // ρ データ
@@ -190,7 +187,7 @@ typedef struct {
     EC_POINT *us_y; // 公開鍵
 
     // セッション鍵
-    //センダー,レシーバは全ノード分(k)、自ノード分のみ(ki)
+    //センダー,レシーバは全ノード分(k)、自ノード分のみ(ki,ki_R)
     unsigned char k[NODES][KEY_LEN];//各ノードとの共有鍵
     unsigned char ki[KEY_LEN];//センダーと自ノードとの共有鍵
     unsigned char ki_R[KEY_LEN];//レシーバと自ノードとの共有鍵

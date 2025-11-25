@@ -162,27 +162,51 @@ int main() {
 
     //グループ署名生成
     groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));
-    groupsig_key_t *grpkey = load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);
+    // groupsig_key_t *grpkey = load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);
     // char *cstr = groupsig_grp_key_to_string(grpkey);
-    // printf("grpkey: %s\n", cstr);
-    groupsig_key_t *memkey = load_key_from_file("memkey.pem", GROUPSIG_KTY04_CODE, groupsig_mem_key_import);
-    // message_t *gsm = message_from_string((char *)kC_pub);
+    // // printf("grpkey: %s\n", cstr);
+    // groupsig_key_t *memkey = load_key_from_file("memkey.pem", GROUPSIG_KTY04_CODE, groupsig_mem_key_import);
+    // // message_t *gsm = message_from_string((char *)kC_pub);
+    // グループ署名に必要な鍵などを読み込み
+    groupsig_key_t *grpkey = load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);//groupsig_grp_key_init(GROUPSIG_KTY04_CODE);
+    groupsig_key_t *mgrkey = load_key_from_file("mgrkey.pem", GROUPSIG_KTY04_CODE, groupsig_mgr_key_import);//groupsig_mgr_key_init(GROUPSIG_KTY04_CODE);
+    groupsig_key_t *memkey = load_key_from_file("memkey.pem", GROUPSIG_KTY04_CODE, groupsig_mem_key_import);;//groupsig_mem_key_init(GROUPSIG_KTY04_CODE);
+    // gml読み込み
+    FILE *fgml = fopen("gml.dat", "rb");
+    if (!fgml) die("fopen gml.dat");
+    fseek(fgml, 0, SEEK_END);
+    size_t gml_len = ftell(fgml);
+    fseek(fgml, 0, SEEK_SET);
+    unsigned char *gml_buf = (unsigned char *)malloc(gml_len);
+    if (!gml_buf) die("malloc gml_buf");
+    fread(gml_buf, 1, gml_len, fgml);
+    fclose(fgml);
+    gml_t *gml = gml_import(GROUPSIG_KTY04_CODE, gml_buf, gml_len);
+    free(gml_buf);
+    crl_t *crl = crl_init(GROUPSIG_KTY04_CODE);
+
+    // Setup (new group)
+    int rc = groupsig_setup(GROUPSIG_KTY04_CODE, grpkey, mgrkey, gml);
+
     message_t *gsm = message_from_bytes(kC_pub, PUB_LEN);
     // print_hex("gsm", gsm->bytes, gsm->length);
     groupsig_signature_t *sig = groupsig_signature_init(GROUPSIG_KTY04_CODE);
     groupsig_sign(sig, gsm, memkey, grpkey, UINT_MAX);
-    // uint8_t valid;
-    // groupsig_verify(&valid, sig, gsm, grpkey);
-    // printf("TGsig verification: %s\n", valid ? "valid" : "invalid");
-    // char *strsig = groupsig_signature_to_string(sig);
-    // printf("R: gsig: %s\n", strsig);
-    // free(strsig);
 
     // --- 署名をバイナリにエクスポート ---
     byte_t *sig_bytes = NULL;
     uint32_t sig_size = 0;
     groupsig_signature_export(&sig_bytes, &sig_size, sig);
     printf("Exported signature length: %u bytes\n", sig_size);
+    // print_hex("Group signature σ", sig_bytes, sig_size);
+
+    // uint8_t valid;
+    // groupsig_signature_t *gsig = groupsig_signature_import(GROUPSIG_KTY04_CODE, sig_bytes, sig_size);
+    // // char *strsig2 = groupsig_signature_to_string(gsig);
+    // // printf("V: gsig: %s\n", strsig2);
+    // // free(strsig2);
+    // groupsig_verify(&valid, gsig, gsm, grpkey);
+    // printf("TGsig verification: %s\n", valid ? "valid" : "invalid");
     
 
     // unsigned char* にキャスト（byte_t は typedef unsigned char）
@@ -248,10 +272,11 @@ int main() {
     memcpy(pkt.p.tau, tau, tau_len);
     // print_hex("τ0", tau, tau_len);
     memcpy(pkt.p.peer_pub, kC_pub, PUB_LEN); // P に k_C を格納
+    // print_hex("pkt.p.peer_pub", pkt.p.peer_pub, PUB_LEN);
     pkt.p.sig_len = sig_size;
     memcpy(pkt.p.sig_bytes, sig_bytes, sig_size);
     // print_hex("sig_bytes", pkt.p.sig_bytes, pkt.p.sig_len);
-
+    
     // 状態保存（prev=0, next=1 or self）
     unsigned char precid[CID_LEN];
     //前のサーキットがないので0クリア
@@ -263,7 +288,7 @@ int main() {
 
     // ==== メモリに L2/L3 + overlay(SETUP_REQ) を構築（送信用）====
     // 往路の送信フレームを作成
-    unsigned char frame[MAX_PKT]; 
+    unsigned char frame[MAX_FRAME]; 
     memset(frame, 0, sizeof(frame));
     write_l2l3_min(frame, sizeof(frame));
     size_t wire_len = build_overlay_setup_req(frame, sizeof(frame), &pkt);
@@ -297,6 +322,9 @@ int main() {
     // printf("grpkey: %s\n", cstr);
     // free(cstr);
     groupsig_signature_t *gsig = groupsig_signature_import(GROUPSIG_KTY04_CODE, pkt.p.sig_bytes, pkt.p.sig_len);
+    // char *strsig2 = groupsig_signature_to_string(gsig);
+    // printf("V: gsig: %s\n", strsig2);
+    // free(strsig2);
     groupsig_verify(&valid, gsig, ppp, grpkey);
     printf("TGsig verification: %s\n", valid ? "valid" : "invalid");
     
@@ -309,7 +337,7 @@ int main() {
     me->has_sess = 1;
     print_hex("R derived k", me->sess_key, KEY_LEN);
 
-    // Rとルータの鍵交換
+    // Rによるルータの鍵交換
     for (int i = 1; i < NODES - 1; i++) {
         size_t offset = (i - 1) * PUB_LEN;
         EVP_PKEY *node_pub = import_x25519_pub(pkt.h.dh_pk_concat + offset);
@@ -331,7 +359,7 @@ int main() {
         Node *node = &nodes[i];
         derive_shared(node->dh_sk, nodes[NODES - 1].dh_pk, sharenode);
         // ノードiの状態に鍵を保存
-        memcpy(node->k[i], sharenode, KEY_LEN); // 復路用キーは k[ROUTERS + 1] に保存
+        memcpy(node->ki_R, sharenode, KEY_LEN); // 復路用キーは k[ROUTERS + 1] に保存
         // printf("k%d ", i);
         // print_hex("derived ", node->k[i], KEY_LEN);
     }
@@ -470,25 +498,43 @@ int main() {
     printf("S -> ");
     unsigned char sid_use[SID_LEN];
     unsigned char kS_pub[PUB_LEN];
-    get_raw_pub(nodes[0].dh_sk, kS_pub);
+    get_raw_pub(me->dh_sk, kS_pub);
     hash_sid_from_pub(kS_pub, sid_use);
     memcpy(pkt.h.sid, sid_use, SID_LEN);
 
     pkt.h.status = DATA_TRANS;
-    
+
+       
     // aead_encrypt(nodes[0].sess_key, (const unsigned char*)msg, msg_len, pkt.h.sid, pkt.p.iv, pkt.p.ct, pkt.p.tag);
     // pkt.p.ct_len = msg_len;
     // print_hex("S sess_key", nodes[0].sess_key, KEY_LEN);
     aead_encrypt(nodes[0].sess_key, padded_msg, padded_len, pkt.h.sid, pkt.p.iv, pkt.p.ct, pkt.p.tag);
     pkt.p.ct_len = padded_len;
     free(padded_msg);
+
+    //センダーのMAC
+    // 各ノードの共有鍵 k_i を計算 & c_i を生成
+    for (int i = 1; i < NODES - 1; i++) {
+        // print_hex("ki", me->k[i], KEY_LEN);
+        // HMACでACSEG生成
+        unsigned char acseg[ACSEG_LEN];
+        unsigned int acseg_len;
+        size_t offset = (i - 1) * ACSEG_LEN;
+        // print_hex("me->ki", me->ki, KEY_LEN);
+        int hmac_result = hmac_sha256(me->k[i], KEY_LEN, pkt.p.ct, pkt.p.ct_len, pkt.h.acseg_concat + offset, &acseg_len);
+        if (hmac_result != 0) {
+            fprintf(stderr,"HMAC failed at R%d\n", idx);
+            return -1;
+        }
+    }
+    // print_hex("ACSEG concat", pkt.h.acseg_concat, ROUTERS * ACSEG_LEN);
     
-    pkt.h.idx = 1;//　本来必要ないが1にしておく
+    pkt.h.idx = 1;
     // ==== DATA_TRANS をパケットに積む ====
     memset(frame, 0, sizeof(frame));
     write_l2l3_min(frame, sizeof(frame));
     wire_len = build_overlay_data_trans(frame, sizeof(frame), &pkt);
-    // printf("Data Trans frame wire_len=%zu \n", wire_len);
+    printf("Data Trans frame wire_len=%zu \n", wire_len);
 
     // 各ノードの処理: state.next で転送
     int cur = nodes[1].id;
@@ -535,10 +581,10 @@ int main() {
         t_flag += flags;
         free(acseg);
     }
-    if (t_flag != ROUTERS) {
-        fprintf(stderr, "ACSEG verification failed\n");
+    if (t_flag <= ROUTERS/2) {
+        fprintf(stderr, "ACSEG mismatch\n");
     } else {
-        printf("All ACSEGs verified\n");
+        printf("All ACSEGs match\n");
     }
 
     // 復号

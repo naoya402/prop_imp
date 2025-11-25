@@ -42,7 +42,27 @@ groupsig_key_t *load_key_from_file(const char *path, uint8_t scheme, groupsig_ke
 int main(void) {
     // グループ署名初期化
     groupsig_init(GROUPSIG_KTY04_CODE, time(NULL));
-    groupsig_key_t *grpkey = load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);
+    // グループ署名に必要な鍵などを読み込み
+    groupsig_key_t *grpkey = load_key_from_file("grpkey.pem", GROUPSIG_KTY04_CODE, groupsig_grp_key_import);//groupsig_grp_key_init(GROUPSIG_KTY04_CODE);
+    groupsig_key_t *mgrkey = load_key_from_file("mgrkey.pem", GROUPSIG_KTY04_CODE, groupsig_mgr_key_import);//groupsig_mgr_key_init(GROUPSIG_KTY04_CODE);
+    groupsig_key_t *memkey = load_key_from_file("memkey.pem", GROUPSIG_KTY04_CODE, groupsig_mem_key_import);;//groupsig_mem_key_init(GROUPSIG_KTY04_CODE);
+    // gml読み込み
+    FILE *fgml = fopen("gml.dat", "rb");
+    if (!fgml) die("fopen gml.dat");
+    fseek(fgml, 0, SEEK_END);
+    size_t gml_len = ftell(fgml);
+    fseek(fgml, 0, SEEK_SET);
+    unsigned char *gml_buf = (unsigned char *)malloc(gml_len);
+    if (!gml_buf) die("malloc gml_buf");
+    fread(gml_buf, 1, gml_len, fgml);
+    fclose(fgml);
+    gml_t *gml = gml_import(GROUPSIG_KTY04_CODE, gml_buf, gml_len);
+    free(gml_buf);
+    crl_t *crl = crl_init(GROUPSIG_KTY04_CODE);
+
+    // Setup (new group)
+    groupsig_setup(GROUPSIG_KTY04_CODE, grpkey, mgrkey, gml);
+
     // US context 初期化
     US_CTX *us = US_init("secp256k1");
     if (!us) { fprintf(stderr,"US_init error\n"); return 1; }
@@ -179,7 +199,7 @@ int main(void) {
     // 7) prev_state
     int prev_state;
     memcpy(&prev_state, report + offset, sizeof(prev_state)); offset += sizeof(prev_state);
-    printf("prev_state: %d\n", prev_state);
+    // printf("prev_state: %d\n", prev_state);
 
     // 8) τ
     unsigned char tau[SIG_LEN];
@@ -244,6 +264,7 @@ int main(void) {
     // 3) groupsig 検証
     // groupsig_signature_t *gsig = groupsig_signature_import(GROUPSIG_KTY04_CODE, groupsig_bytes, groupsig_len);
     uint8_t val;
+    print_hex("k_S", k_S, PUB_LEN);
     message_t *kSb = message_from_bytes(k_S, PUB_LEN);
     groupsig_verify(&val, sig, kSb, grpkey);
     printf("TGsig verification: %s\n", val ? "valid" : "invalid");
@@ -344,33 +365,16 @@ int main(void) {
     printf("Verify τ%d success\n", prev_idx);
 
     // // === Open（署名者を特定） ===
-    // // crl, gml, mgrkeyの読み込み
-    // crl_t *crl = crl_init(GROUPSIG_KTY04_CODE); // 失効リスト
-    // groupsig_key_t *mgrkey = load_key_from_file("mgrkey.pem", GROUPSIG_KTY04_CODE, groupsig_mgr_key_import);
-
-    // // gml読み込み
-    // FILE *fgml = fopen("gml.dat", "rb");
-    // if (!fgml) die("fopen gml.dat");
-    // fseek(fgml, 0, SEEK_END);
-    // size_t gml_len = ftell(fgml);
-    // fseek(fgml, 0, SEEK_SET);
-    // unsigned char *gml_buf = (unsigned char *)malloc(gml_len);
-    // if (!gml_buf) die("malloc gml_buf");
-    // fread(gml_buf, 1, gml_len, fgml);
-    // fclose(fgml);
-    // gml_t *gml = gml_import(GROUPSIG_KTY04_CODE, gml_buf, gml_len);
-    // free(gml_buf);
-
-    // uint64_t id = UINT64_MAX;
-    // int rc = groupsig_open(&id, NULL, NULL, sig, grpkey, mgrkey, gml);
-    // if (rc == IOK) {
-    //     printf("Open success: member ID = %lu\n", id);
-    // } else {
-    //     printf("Open failed.\n");
-    // }
+    uint64_t id = UINT64_MAX;
+    int rc = groupsig_open(&id, NULL, NULL, sig, grpkey, mgrkey, gml);
+    if (rc == IOK) {
+        printf("Open success: member ID = %lu\n", id);
+    } else {
+        printf("Open failed.\n");
+    }
     
     // ルータから得たidリストと比較してSを特定
-    uint64_t id = 0;
+    // uint64_t id = 0;
     const char *signer = router_addresses[id]; // 仮にidをインデックスとしてSを特定
     // gml_entry_t *entry = gml_get(gml, id);
     // if (!entry) {
@@ -645,24 +649,24 @@ int main(void) {
     // すべてオネストな検証をしていれば経由した1~nのノードになっているはず
     // 攻撃者が1人ならn-1、攻撃者が2人ならn-2、...となるはず
     printf("Flags value: %d\n", flags);
-    // // === Reveal（特定メンバーを公開処理(CRLに入れる)） ===
-    // trapdoor_t *trapdoor = trapdoor_init(GROUPSIG_KTY04_CODE);
-    // rc = groupsig_reveal(trapdoor, crl, gml, id);
-    // if (rc == IOK && trapdoor != NULL) {
-    //     printf("Reveal success: trapdoor valid, member ID = %lu added to CRL.\n", id);
-    // } else {
-    //     printf("Reveal failed.\n");
-    // }
+    // === Reveal（特定メンバーを公開処理(CRLに入れる)） ===
+    trapdoor_t *trapdoor = trapdoor_init(GROUPSIG_KTY04_CODE);
+    rc = groupsig_reveal(trapdoor, crl, gml, id);
+    if (rc == IOK && trapdoor != NULL) {
+        printf("Reveal success: trapdoor valid, member ID = %lu added to CRL.\n", id);
+    } else {
+        printf("Reveal failed.\n");
+    }
 
-    // // CRLをRに送信?(共有している想定なら不要)
+    // CRLをRに送信?(共有している想定なら不要)
 
-    // // Rの処理
-    // // === Trace（署名が公開済み(CRL登録済)メンバーによるものか確認） ===
-    // uint8_t traced = 0;
-    // rc = groupsig_trace(&traced, sig, grpkey, crl, NULL, NULL);
-    // if (rc == IOK) {
-    //     printf("Trace result: %d (1 = traced, 0 = not traced)\n", (int)traced);
-    // } else {
-    //     printf("Trace failed.\n");
-    // }
+    // Rの処理
+    // === Trace（署名が公開済み(CRL登録済)メンバーによるものか確認） ===
+    uint8_t traced = 0;
+    rc = groupsig_trace(&traced, sig, grpkey, crl, NULL, NULL);
+    if (rc == IOK) {
+        printf("Trace result: %d (1 = traced, 0 = not traced)\n", (int)traced);
+    } else {
+        printf("Trace failed.\n");
+    }
 }
